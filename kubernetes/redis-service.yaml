@@ -1,0 +1,26 @@
+# redis-service.yaml
+# -------------------
+# Kubernetes Service manifest for Redis
+# - Exposes Redis on port 6379 within the cluster (ClusterIP)
+# - Internal-only (not exposed to the internet)
+# - Labels for monitoring/observability
+# - Matches the StatefulSet selector
+#
+# Apply with: kubectl apply -f kubernetes/redis-service.yaml
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  labels:
+    app: redis
+    tier: backend
+spec:
+  type: ClusterIP  # Internal-only service
+  ports:
+    - port: 6379
+      targetPort: 6379
+      protocol: TCP
+      name: redis
+  selector:
+    app: redis

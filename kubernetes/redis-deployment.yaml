@@ -1,0 +1,67 @@
+# redis-deployment.yaml
+# ----------------------
+# Kubernetes StatefulSet manifest for Redis (production-ready)
+# - Uses official Redis 7 image
+# - Persistent storage for data durability
+# - Resource requests/limits for scheduling and stability
+# - Readiness/liveness probes for health monitoring
+# - Labels for monitoring/observability
+#
+# NOTE: Assumes a default StorageClass is available in your cluster.
+#
+# Apply with: kubectl apply -f kubernetes/redis-deployment.yaml
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  labels:
+    app: redis
+    tier: backend
+spec:
+  serviceName: "redis"
+  replicas: 1  # For production, consider Redis Sentinel/Cluster for HA
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+        tier: backend
+    spec:
+      containers:
+      - name: redis
+        image: redis:7
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        ports:
+        - containerPort: 6379
+          name: redis
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        args: ["--appendonly", "yes"]  # Enable AOF persistence for durability
+        livenessProbe:
+          tcpSocket:
+            port: 6379
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          tcpSocket:
+            port: 6379
+          initialDelaySeconds: 5
+          periodSeconds: 10
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 10Gi

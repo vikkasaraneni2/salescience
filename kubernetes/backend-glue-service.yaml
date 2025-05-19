@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-glue
+spec:
+  selector:
+    app: backend-glue
+  ports:
+    - protocol: TCP
+      port: 8200
+      targetPort: 8200
+  type: ClusterIP 

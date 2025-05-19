@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+redis
+requests
+httpx
+python-dotenv
+yfinance
+pydantic
+prometheus_client
+rq 

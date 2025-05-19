@@ -1,0 +1,74 @@
+# orchestrator-deployment.yaml
+# ----------------------------
+# Kubernetes Deployment manifest for Orchestrator API
+# - Runs the orchestrator FastAPI app
+# - Resource requests/limits for stability
+# - Liveness/readiness probes for health monitoring
+# - Pod anti-affinity for high availability
+# - Environment variables from ConfigMap/Secret
+#
+# Apply with: kubectl apply -f kubernetes/orchestrator-deployment.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator-api
+  labels:
+    app: orchestrator-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: orchestrator-api
+  template:
+    metadata:
+      labels:
+        app: orchestrator-api
+      annotations:
+        sidecar.istio.io/inject: "true"  # Enable Istio sidecar injection
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - orchestrator-api
+            topologyKey: "kubernetes.io/hostname"
+      containers:
+        - name: orchestrator-api
+          image: yourrepo/orchestrator-api:latest  # Replace with your actual image
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8100
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secrets
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8100
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8100
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            readOnlyRootFilesystem: false 

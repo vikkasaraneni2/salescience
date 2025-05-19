@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  labels:
+    app: salescience
+
+data:
+  REDIS_URL: "redis://redis:6379/0"
+  POSTGRES_URL: "postgresql://postgres:postgres@postgres:5432/salescience"
+  POSTGRES_DB: "salescience"
+  POSTGRES_USER: "postgres"
+  VECTOR_DIM: "384"
+  EMBED_MODEL: "all-MiniLM-L6-v2"
+  EMBED_BATCH: "32"
+  EMBED_BLOCK: "5000"
+  CLAIM_IDLE_MS: "60000"
+  CLAIM_BATCH: "50"
+  EMBED_RETRIES: "3"
+  METRICS_PORT: "9103"
+  OPENAI_MODEL: "gpt-3.5-turbo"
+  OPENAI_MAX_TOKENS: "2000"
+  OPENAI_TEMPERATURE: "0.7"
+  LOGLEVEL: "INFO" 

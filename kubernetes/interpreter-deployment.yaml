@@ -1,0 +1,58 @@
+# interpreter-deployment.yaml
+# ----------------------------
+# Kubernetes Deployment manifest for Interpreter Service
+# - Runs the interpreter FastAPI app
+# - Resource requests/limits for stability
+# - Liveness/readiness probes for health monitoring
+# - Pod anti-affinity for high availability
+#
+# Apply with: kubectl apply -f kubernetes/interpreter-deployment.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: interpreter
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: interpreter
+  template:
+    metadata:
+      labels:
+        app: interpreter
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - interpreter
+            topologyKey: "kubernetes.io/hostname"
+      containers:
+      - name: interpreter
+        image: yourrepo/interpreter:latest
+        ports:
+        - containerPort: 8000
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 10 

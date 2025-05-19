@@ -1,0 +1,53 @@
+# backend-glue-deployment.yaml
+# ----------------------------
+# Kubernetes Deployment manifest for Backend Glue Service
+# - Runs the backend glue FastAPI app
+# - Resource requests/limits for stability
+# - Liveness/readiness probes for health monitoring
+# - Environment variables for service discovery
+#
+# Apply with: kubectl apply -f kubernetes/backend-glue-deployment.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-glue
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend-glue
+  template:
+    metadata:
+      labels:
+        app: backend-glue
+    spec:
+      containers:
+      - name: backend-glue
+        image: yourrepo/backend-glue:latest
+        ports:
+        - containerPort: 8200
+        env:
+        - name: INTERPRETER_URL
+          value: "http://interpreter:8000/interpret_query"
+        - name: ORCHESTRATOR_URL
+          value: "http://orchestrator:8100/submit"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8200
+          initialDelaySeconds: 10
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8200
+          initialDelaySeconds: 5
+          periodSeconds: 10 
