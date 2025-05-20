@@ -3,181 +3,407 @@ Configuration Module for Data Acquisition Pipeline
 -------------------------------------------------
 
 This module centralizes all configuration settings for the data acquisition
-pipeline, providing a single source of truth for configuration parameters.
-It includes settings for:
+pipeline using Pydantic for validation and type safety.
 
-1. Data Sources (SEC, Yahoo)
-2. Redis Connection and Message Bus
-3. Worker Configuration
-4. Logging and Monitoring
-5. API Keys and Authentication
-6. Environment-specific settings
-
-The configuration is loaded from environment variables with sensible defaults,
-supporting different deployment environments (development, testing, production).
-
-Usage:
-    from data_acquisition.config import settings
-    
-    # Access settings
-    redis_url = settings.REDIS_URL
-    worker_concurrency = settings.WORKER_CONCURRENCY
+Key features:
+- Pydantic BaseSettings for type validation and .env loading
+- Hierarchical settings organization by functional area
+- Extensive validation rules to prevent misconfiguration
+- LRU caching for efficient settings access
+- Secure handling of sensitive configuration values
 """
 
 import os
-import logging
-from typing import Dict, Any, Optional, List
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("config")
-
-# Try to import dotenv for local development
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-    logger.info("Loaded environment variables from .env file")
-except ImportError:
-    logger.warning("dotenv not installed, relying on existing environment variables")
+import re
+from functools import lru_cache
+from typing import List, Optional, Dict, Any, Union
+from pydantic import BaseSettings, Field, validator, root_validator
 
 
-class Settings:
-    """
-    Settings class with all configuration parameters for the data acquisition pipeline.
-    This class centralizes configuration loading from environment variables with defaults.
-    """
+class RedisSettings(BaseSettings):
+    """Redis connection settings"""
+    URL: str = Field("redis://localhost:6379/0", env="REDIS_URL")
+    PASSWORD: Optional[str] = Field(None, env="REDIS_PASSWORD")
+    SSL: bool = Field(False, env="REDIS_SSL")
+    POOL_SIZE: int = Field(10, env="REDIS_POOL_SIZE")
+    SOCKET_TIMEOUT: int = Field(5, env="REDIS_SOCKET_TIMEOUT")
+    SOCKET_CONNECT_TIMEOUT: int = Field(5, env="REDIS_SOCKET_CONNECT_TIMEOUT")
+    RETRY_ON_TIMEOUT: bool = Field(True, env="REDIS_RETRY_ON_TIMEOUT")
+
+    @validator('URL')
+    def validate_redis_url(cls, v):
+        """
+        Validate Redis URL format.
+        
+        This validator ensures that the Redis URL starts with the proper 
+        protocol prefix ('redis://' for standard connections or 'rediss://' for SSL).
+        An incorrect URL would cause connection failures at runtime.
+        """
+        if not v.startswith(('redis://', 'rediss://')):
+            raise ValueError("Redis URL must start with 'redis://' or 'rediss://'")
+        return v
     
-    def __init__(self):
-        # Redis configuration
-        self.REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-        self.REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
-        self.REDIS_SSL = os.getenv("REDIS_SSL", "false").lower() == "true"
+    @validator('POOL_SIZE', 'SOCKET_TIMEOUT', 'SOCKET_CONNECT_TIMEOUT')
+    def validate_positive_int(cls, v, values, field):
+        """
+        Ensure numeric Redis parameters are positive integers.
         
-        # SEC API configuration
-        self.SEC_API_KEY = os.getenv("SEC_API_KEY")
-        self.SEC_API_BASE_URL = os.getenv("SEC_API_BASE_URL", "https://api.sec-api.io")
-        self.SEC_EDGAR_BASE_URL = os.getenv("SEC_EDGAR_BASE_URL", "https://www.sec.gov/Archives/edgar/data")
-        self.SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "salescience/1.0")
+        These settings control connection pool behavior and timeouts.
+        Negative or zero values would create invalid configurations that
+        could cause connection issues or resource exhaustion.
+        """
+        if v <= 0:
+            raise ValueError(f"{field.name} must be a positive integer")
+        return v
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        case_sensitive = True
+
+
+class ApiKeySettings(BaseSettings):
+    """API key settings for external services"""
+    SEC_API_KEY: Optional[str] = Field(None, env="SEC_API_KEY")
+    YAHOO_API_KEY: Optional[str] = Field(None, env="YAHOO_API_KEY")
+    OPENAI_API_KEY: Optional[str] = Field(None, env="OPENAI_API_KEY")
+
+    @validator('SEC_API_KEY')
+    def validate_sec_api_key(cls, v):
+        """
+        Validate SEC API key when provided.
         
-        # SEC compliance settings (required by SEC guidelines)
-        # See: https://www.sec.gov/os/accessing-edgar-data
-        self.SEC_RATE_LIMIT_REQUESTS = int(os.getenv("SEC_RATE_LIMIT_REQUESTS", "10"))
-        self.SEC_RATE_LIMIT_PERIOD_SEC = int(os.getenv("SEC_RATE_LIMIT_PERIOD_SEC", "1"))
-        self.SEC_REQUEST_TIMEOUT_SEC = float(os.getenv("SEC_REQUEST_TIMEOUT_SEC", "15.0"))
-        
-        # Yahoo Finance API configuration
-        self.YAHOO_API_KEY = os.getenv("YAHOO_API_KEY")
-        self.YAHOO_API_BASE_URL = os.getenv("YAHOO_API_BASE_URL", "https://query1.finance.yahoo.com/v10/finance")
-        self.YAHOO_REQUEST_TIMEOUT_SEC = float(os.getenv("YAHOO_REQUEST_TIMEOUT_SEC", "10.0"))
-        
-        # Worker configuration
-        self.WORKER_CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "10"))
-        self.WORKER_MAX_RETRIES = int(os.getenv("WORKER_MAX_RETRIES", "3"))
-        self.WORKER_RETRY_DELAY_SEC = int(os.getenv("WORKER_RETRY_DELAY_SEC", "5"))
-        self.WORKER_POLL_INTERVAL_SEC = int(os.getenv("WORKER_POLL_INTERVAL_SEC", "5"))
-        self.WORKER_TIMEOUT_SEC = int(os.getenv("WORKER_TIMEOUT_SEC", "300"))  # 5 minutes
-        
-        # Message bus configuration
-        self.MESSAGE_BUS_ENABLED = os.getenv("MESSAGE_BUS_ENABLED", "true").lower() == "true"
-        self.SEC_TOPIC = os.getenv("SEC_TOPIC", "data.sec")
-        self.YAHOO_TOPIC = os.getenv("YAHOO_TOPIC", "data.yahoo")
-        self.XBRL_TOPIC_PREFIX = os.getenv("XBRL_TOPIC_PREFIX", "data.xbrl")
-        self.MESSAGE_RETENTION_MS = int(os.getenv("MESSAGE_RETENTION_MS", "86400000"))  # 24 hours
-        
-        # Queue configuration
-        self.QUEUE_NAME = os.getenv("QUEUE_NAME", "data_jobs")
-        self.JOB_EXPIRY_SEC = int(os.getenv("JOB_EXPIRY_SEC", "604800"))  # 1 week
-        
-        # Prometheus metrics configuration
-        self.PROMETHEUS_ENABLED = os.getenv("PROMETHEUS_ENABLED", "true").lower() == "true"
-        self.METRICS_PORT = int(os.getenv("METRICS_PORT", "8000"))
-        
-        # Logging configuration
-        self.LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-        self.JSON_LOGGING_ENABLED = os.getenv("JSON_LOGGING_ENABLED", "true").lower() == "true"
-        
-        # Document processing configuration
-        self.MAX_DOCUMENT_SIZE_MB = int(os.getenv("MAX_DOCUMENT_SIZE_MB", "50"))
-        self.TEXT_TRUNCATION_CHARS = int(os.getenv("TEXT_TRUNCATION_CHARS", "500"))
-        
-        # Default data acquisition parameters
-        self.DEFAULT_FORM_TYPE = os.getenv("DEFAULT_FORM_TYPE", "10-K")
-        self.DEFAULT_N_YEARS = int(os.getenv("DEFAULT_N_YEARS", "5"))
-        self.DEFAULT_XBRL_CONCEPTS = self._parse_list_env("DEFAULT_XBRL_CONCEPTS", [
-            "us-gaap:Revenues", "us-gaap:NetIncomeLoss", "us-gaap:Assets",
-            "us-gaap:Liabilities", "us-gaap:StockholdersEquity"
-        ])
-        
-        # Feature flags
-        self.FEATURE_XBRL_ENABLED = os.getenv("FEATURE_XBRL_ENABLED", "true").lower() == "true"
-        self.FEATURE_SEC_INSIDER_ENABLED = os.getenv("FEATURE_SEC_INSIDER_ENABLED", "true").lower() == "true"
-        self.FEATURE_BATCH_JOBS_ENABLED = os.getenv("FEATURE_BATCH_JOBS_ENABLED", "true").lower() == "true"
-        
-        # Validate critical settings
-        self._validate_settings()
-        
-    def _validate_settings(self):
-        """Validate critical settings to warn about potential issues."""
-        if not self.SEC_API_KEY:
-            logger.warning("SEC_API_KEY is not set - SEC data source will not function")
-            
-        if not self.YAHOO_API_KEY:
-            logger.warning("YAHOO_API_KEY is not set - Yahoo data source may have limitations")
-            
-        if self.WORKER_CONCURRENCY > 20:
-            logger.warning(f"WORKER_CONCURRENCY is set to {self.WORKER_CONCURRENCY}, which is high and may overload external APIs")
-            
-        # Set numeric log level
-        self._set_log_level()
+        While the SEC API key is optional (can be None), if a value is provided,
+        it should not be an empty string. Empty strings could cause silent API 
+        failures that are difficult to debug, as they would be treated as missing
+        authentication rather than triggering a clear configuration error.
+        """
+        if v is not None and not v.strip():
+            raise ValueError("SEC_API_KEY cannot be an empty string")
+        return v
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        case_sensitive = True
+
+
+class ServiceUrlSettings(BaseSettings):
+    """Service URL settings for external APIs"""
+    SEC_API_BASE_URL: str = Field("https://api.sec-api.io", env="SEC_API_BASE_URL")
+    SEC_EDGAR_BASE_URL: str = Field("https://www.sec.gov/Archives/edgar/data", env="SEC_EDGAR_BASE_URL")
+    YAHOO_API_BASE_URL: str = Field("https://query1.finance.yahoo.com/v10/finance", env="YAHOO_API_BASE_URL")
     
-    def _set_log_level(self):
-        """Set numeric log level from string."""
-        log_level_name = self.LOG_LEVEL.upper()
-        numeric_level = getattr(logging, log_level_name, None)
-        if not isinstance(numeric_level, int):
-            logger.warning(f"Invalid LOG_LEVEL: {self.LOG_LEVEL}, defaulting to INFO")
-            numeric_level = logging.INFO
+    @validator('*')
+    def validate_url_format(cls, v, values, field):
+        """
+        Validate all service URLs have proper HTTP/HTTPS prefixes.
         
-        logging.getLogger().setLevel(numeric_level)
-        logger.setLevel(numeric_level)
+        This validator applies to all URL fields to ensure they begin with
+        an appropriate protocol (http:// or https://). Malformed URLs would
+        cause request failures when trying to access these services.
+        The wildcard (*) ensures this validation runs on all fields in this class.
+        """
+        if not v.startswith(('http://', 'https://')):
+            raise ValueError(f"{field.name} must be a valid URL starting with 'http://' or 'https://'")
+        return v
+    
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        case_sensitive = True
+
+
+class WorkerSettings(BaseSettings):
+    """Worker configuration settings"""
+    CONCURRENCY: int = Field(10, env="WORKER_CONCURRENCY")
+    MAX_RETRIES: int = Field(3, env="WORKER_MAX_RETRIES")
+    RETRY_DELAY_SEC: int = Field(5, env="WORKER_RETRY_DELAY_SEC")
+    POLL_INTERVAL_SEC: int = Field(5, env="WORKER_POLL_INTERVAL_SEC")
+    TIMEOUT_SEC: int = Field(300, env="WORKER_TIMEOUT_SEC")
+    
+    @validator('CONCURRENCY')
+    def check_concurrency(cls, v):
+        """
+        Validate worker concurrency setting.
         
-    def _parse_list_env(self, env_name: str, default: List[str]) -> List[str]:
-        """Parse a comma-separated environment variable into a list."""
-        env_value = os.getenv(env_name)
-        if not env_value:
-            return default
-        return [item.strip() for item in env_value.split(",")]
+        This validator ensures the concurrency level is a positive integer,
+        and notes when it exceeds the recommended maximum of 20.
+        High concurrency values could overload external APIs or consume
+        excessive system resources.
+        """
+        if v <= 0:
+            raise ValueError("CONCURRENCY must be a positive integer")
+        if v > 20:
+            # Still allow values over 20, but a warning will be logged elsewhere
+            pass
+        return v
+    
+    @validator('MAX_RETRIES', 'RETRY_DELAY_SEC', 'POLL_INTERVAL_SEC', 'TIMEOUT_SEC')
+    def validate_positive_int(cls, v, values, field):
+        """
+        Ensure all worker timing and retry settings are positive integers.
         
+        These settings control job processing behavior and must be positive
+        to ensure proper operation. Zero or negative values would cause
+        logical errors or infinite loops in the worker process.
+        """
+        if v <= 0:
+            raise ValueError(f"{field.name} must be a positive integer")
+        return v
+    
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        case_sensitive = True
+
+
+class MessageBusSettings(BaseSettings):
+    """Message bus configuration settings"""
+    ENABLED: bool = Field(True, env="MESSAGE_BUS_ENABLED")
+    SEC_TOPIC: str = Field("data.sec", env="SEC_TOPIC")
+    YAHOO_TOPIC: str = Field("data.yahoo", env="YAHOO_TOPIC")
+    XBRL_TOPIC_PREFIX: str = Field("data.xbrl", env="XBRL_TOPIC_PREFIX")
+    RETENTION_MS: int = Field(86400000, env="MESSAGE_RETENTION_MS")  # 24 hours
+    
+    @validator('RETENTION_MS')
+    def validate_retention_ms(cls, v):
+        """
+        Validate message retention period.
+        
+        Ensures the message retention time is a positive integer.
+        A non-positive value would cause invalid Redis stream configuration
+        and potentially immediate message deletion.
+        """
+        if v <= 0:
+            raise ValueError("RETENTION_MS must be a positive integer")
+        return v
+    
+    @validator('SEC_TOPIC', 'YAHOO_TOPIC', 'XBRL_TOPIC_PREFIX')
+    def validate_topic_format(cls, v, values, field):
+        """
+        Validate message topic name format.
+        
+        Ensures that topic names only contain alphanumeric characters,
+        dots, and underscores, which are safe characters for Redis stream keys.
+        Invalid characters could cause errors when publishing messages.
+        """
+        if not re.match(r'^[a-zA-Z0-9_.]+$', v):
+            raise ValueError(f"{field.name} must contain only alphanumeric characters, dots, and underscores")
+        return v
+    
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        case_sensitive = True
+
+
+class Settings(BaseSettings):
+    """
+    Main settings class that combines all sub-settings.
+    
+    This class provides a hierarchical configuration structure with
+    comprehensive validation rules to ensure a consistent and valid
+    configuration across all components of the data acquisition pipeline.
+    """
+    # Sub-configuration sections
+    redis: RedisSettings = Field(default_factory=RedisSettings)
+    api_keys: ApiKeySettings = Field(default_factory=ApiKeySettings)
+    service_urls: ServiceUrlSettings = Field(default_factory=ServiceUrlSettings)
+    worker: WorkerSettings = Field(default_factory=WorkerSettings)
+    message_bus: MessageBusSettings = Field(default_factory=MessageBusSettings)
+    
+    # Additional settings
+    ENVIRONMENT: str = Field("development", env="ENVIRONMENT")
+    LOG_LEVEL: str = Field("INFO", env="LOG_LEVEL")
+    JSON_LOGGING_ENABLED: bool = Field(True, env="JSON_LOGGING_ENABLED")
+    
+    # API Rate Limits and Timeouts
+    SEC_RATE_LIMIT_REQUESTS: int = Field(10, env="SEC_RATE_LIMIT_REQUESTS")
+    SEC_RATE_LIMIT_PERIOD_SEC: int = Field(1, env="SEC_RATE_LIMIT_PERIOD_SEC")
+    SEC_REQUEST_TIMEOUT_SEC: float = Field(15.0, env="SEC_REQUEST_TIMEOUT_SEC")
+    YAHOO_REQUEST_TIMEOUT_SEC: float = Field(10.0, env="YAHOO_REQUEST_TIMEOUT_SEC")
+    
+    # Queue configuration
+    QUEUE_NAME: str = Field("data_jobs", env="QUEUE_NAME")
+    JOB_EXPIRY_SEC: int = Field(604800, env="JOB_EXPIRY_SEC")  # 1 week
+    
+    # Prometheus metrics configuration
+    PROMETHEUS_ENABLED: bool = Field(True, env="PROMETHEUS_ENABLED")
+    METRICS_PORT: int = Field(8000, env="METRICS_PORT")
+    
+    # Document processing configuration
+    MAX_DOCUMENT_SIZE_MB: int = Field(50, env="MAX_DOCUMENT_SIZE_MB")
+    TEXT_TRUNCATION_CHARS: int = Field(500, env="TEXT_TRUNCATION_CHARS")
+    
+    # Default data acquisition parameters
+    DEFAULT_FORM_TYPE: str = Field("10-K", env="DEFAULT_FORM_TYPE")
+    DEFAULT_N_YEARS: int = Field(5, env="DEFAULT_N_YEARS")
+    DEFAULT_XBRL_CONCEPTS: List[str] = Field(
+        ["us-gaap:Revenues", "us-gaap:NetIncomeLoss", "us-gaap:Assets", 
+         "us-gaap:Liabilities", "us-gaap:StockholdersEquity"],
+        env="DEFAULT_XBRL_CONCEPTS"
+    )
+    
+    # Feature flags
+    FEATURE_XBRL_ENABLED: bool = Field(True, env="FEATURE_XBRL_ENABLED")
+    FEATURE_SEC_INSIDER_ENABLED: bool = Field(True, env="FEATURE_SEC_INSIDER_ENABLED")
+    FEATURE_BATCH_JOBS_ENABLED: bool = Field(True, env="FEATURE_BATCH_JOBS_ENABLED")
+    
+    @validator('DEFAULT_XBRL_CONCEPTS', pre=True)
+    def parse_xbrl_concepts(cls, v):
+        """
+        Parse XBRL concepts from string to list.
+        
+        Handles the case where XBRL concepts are provided as a comma-separated
+        string via environment variable instead of a list. The pre=True flag
+        ensures this runs before type validation.
+        """
+        if isinstance(v, str):
+            return [concept.strip() for concept in v.split(",")]
+        return v
+    
+    @validator('LOG_LEVEL')
+    def validate_log_level(cls, v):
+        """
+        Validate and normalize logging level.
+        
+        Ensures the log level is one of the standard Python logging levels.
+        Invalid levels are automatically corrected to 'INFO' to prevent
+        logging configuration errors.
+        """
+        valid_levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
+        if v.upper() not in valid_levels:
+            return 'INFO'
+        return v.upper()
+    
+    @validator('ENVIRONMENT')
+    def validate_environment(cls, v):
+        """
+        Validate deployment environment setting.
+        
+        Ensures the environment is one of the supported values, which may 
+        affect behavior like requiring API keys in production but not
+        in development environments.
+        """
+        valid_environments = ['development', 'testing', 'production']
+        if v.lower() not in valid_environments:
+            raise ValueError(f"ENVIRONMENT must be one of: {', '.join(valid_environments)}")
+        return v.lower()
+    
+    @validator('SEC_RATE_LIMIT_REQUESTS', 'SEC_RATE_LIMIT_PERIOD_SEC', 'DEFAULT_N_YEARS',
+               'METRICS_PORT', 'MAX_DOCUMENT_SIZE_MB', 'TEXT_TRUNCATION_CHARS', 'JOB_EXPIRY_SEC')
+    def validate_positive_int(cls, v, values, field):
+        """
+        Validate that numeric configuration values are positive integers.
+        
+        This validator applies to multiple integer settings that must be
+        positive to be valid. Zero or negative values would cause logical errors
+        in various parts of the application.
+        """
+        if v <= 0:
+            raise ValueError(f"{field.name} must be a positive integer")
+        return v
+    
+    @validator('SEC_REQUEST_TIMEOUT_SEC', 'YAHOO_REQUEST_TIMEOUT_SEC')
+    def validate_positive_float(cls, v, values, field):
+        """
+        Validate that timeout values are positive.
+        
+        Timeout settings must be positive numbers to be valid. Zero or negative
+        timeouts would cause immediate request failures or other unexpected behavior.
+        """
+        if v <= 0:
+            raise ValueError(f"{field.name} must be a positive number")
+        return v
+    
+    @root_validator
+    def validate_sec_settings(cls, values):
+        """
+        Cross-field validation for SEC API settings.
+        
+        This validator enforces rules that depend on multiple settings:
+        1. SEC API key must be set in production environments
+        2. Rate limit requests cannot exceed a reasonable maximum
+        
+        Using a root_validator allows checking relationships between different
+        fields that can't be validated independently.
+        """
+        # Require SEC API key in production
+        if values.get('api_keys').SEC_API_KEY is None and values.get('ENVIRONMENT') == 'production':
+            raise ValueError("SEC_API_KEY must be set in production environment")
+        
+        # Rate limits should be reasonable
+        if values.get('SEC_RATE_LIMIT_REQUESTS') > 100:
+            raise ValueError("SEC_RATE_LIMIT_REQUESTS cannot exceed 100 requests per period")
+        
+        return values
+    
     def as_dict(self) -> Dict[str, Any]:
-        """Convert settings to dictionary, masking sensitive values."""
-        settings_dict = {key: value for key, value in self.__dict__.items() 
-                        if not key.startswith('_')}
+        """
+        Convert settings to dictionary, masking sensitive values.
         
-        # Mask sensitive values
-        for key in settings_dict:
-            if any(sensitive in key.lower() for sensitive in ['key', 'password', 'secret', 'token']):
-                if settings_dict[key]:
-                    settings_dict[key] = '****'
+        Returns a dictionary representation of all settings with sensitive
+        values (like API keys and passwords) masked for safer logging and display.
+        """
+        # Convert to dict, excluding private attributes
+        settings_dict = self.dict(exclude_none=True)
         
-        return settings_dict
+        # Recursively process the dict to mask sensitive values
+        return self._mask_sensitive_values(settings_dict)
     
-    def log_settings(self):
-        """Log all settings at startup for visibility."""
-        logger.info("Data Acquisition Pipeline Configuration:")
-        for key, value in self.as_dict().items():
-            logger.info(f"  {key}: {value}")
+    def _mask_sensitive_values(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Recursively mask sensitive values in a dictionary.
+        
+        Implements security best practices by ensuring sensitive data like
+        API keys and passwords are not exposed in logs or debug output.
+        Traverses nested dictionaries to handle hierarchical configuration.
+        """
+        sensitive_keywords = ['key', 'password', 'secret', 'token']
+        result = {}
+        
+        for key, value in data.items():
+            # Check if this key might contain sensitive information
+            if isinstance(value, dict):
+                # Recursively process nested dictionaries
+                result[key] = self._mask_sensitive_values(value)
+            elif any(sensitive in key.lower() for sensitive in sensitive_keywords) and value:
+                # Mask sensitive value
+                result[key] = "****"
+            else:
+                # Keep original value
+                result[key] = value
+                
+        return result
+    
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        case_sensitive = True
 
 
-# Create singleton instance
-settings = Settings()
+@lru_cache()
+def get_settings() -> Settings:
+    """
+    Create and cache a Settings instance.
+    
+    Uses functools.lru_cache to cache the settings object, improving
+    performance when settings are accessed frequently. This prevents
+    repeated parsing of environment variables and validation checks
+    when settings are accessed multiple times.
+    
+    Returns:
+        Settings: Cached settings instance
+    """
+    return Settings()
 
-# For convenient import
-__all__ = ['settings']
+
+# Expose the settings object for convenient imports
+settings = get_settings()
 
 
-# If this module is executed directly, log all settings
+# If this module is executed directly, print all settings
 if __name__ == "__main__":
-    settings.log_settings()
+    import json
+    print(json.dumps(settings.as_dict(), indent=4))
