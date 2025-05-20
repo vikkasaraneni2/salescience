@@ -8,6 +8,7 @@ import json             # JSON parsing and serialization
 import time             # Time access and conversions
 from typing import Dict, Any, List, Optional  # Type annotations
 from abc import ABC, abstractmethod           # Abstract base classes
+from config import settings  # Centralized configuration
 
 # Configure logging for the entire module
 # This sets up console logging with timestamps and log levels
@@ -19,20 +20,13 @@ logging.basicConfig(
 # Get logger specific to this module - all logs will show "sec_client" as the source
 logger = logging.getLogger("sec_client")
 
-# Environment variables
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    logger.warning("dotenv not installed, relying on existing environment variables")
-
-# Get API key and Redis URL from environment
-SEC_API_KEY = os.getenv("SEC_API_KEY")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+# Get API key and Redis URL from centralized settings
+SEC_API_KEY = settings.api_keys.SEC_API_KEY
+REDIS_URL = settings.redis.URL
 
 # SEC API configuration
-SEC_API_BASE_URL = "https://api.sec-api.io"
-SEC_EDGAR_BASE_URL = "https://www.sec.gov/Archives/edgar/data"
+SEC_API_BASE_URL = settings.service_urls.SEC_API_BASE_URL
+SEC_EDGAR_BASE_URL = settings.service_urls.SEC_EDGAR_BASE_URL
 
 # Optional: Prometheus metrics for observability
 try:
@@ -172,7 +166,7 @@ def get_cik_for_ticker(ticker: str) -> str:
                   or another API error occurs
     """
     if not SEC_API_KEY:
-        error_msg = "SEC_API_KEY is not set in the environment."
+        error_msg = "SEC_API_KEY is not set in the configuration."
         logger.error(error_msg)
         raise ValueError(error_msg)
     
@@ -293,13 +287,13 @@ class SECDataSource(BaseDataSource):
         
         # Verify API key is available
         if not SEC_API_KEY:
-            error_msg = "SEC_API_KEY is not set in the environment."
+            error_msg = "SEC_API_KEY is not set in the configuration."
             logger.error(error_msg)
             raise ValueError(error_msg)
             
         # Log user agent and contact info for SEC compliance
         headers = {
-            "User-Agent": os.getenv("SEC_USER_AGENT", "salescience/1.0"),
+            "User-Agent": settings.SEC_USER_AGENT,
             "Accept": "application/json",
         }
         
@@ -483,8 +477,8 @@ class SECDataSource(BaseDataSource):
         ticker = params.get('ticker')
         
         if not SEC_API_KEY:
-            logger.error("SEC_API_KEY is not set in the environment.")
-            raise ValueError("SEC_API_KEY is not set in the environment.")
+            logger.error("SEC_API_KEY is not set in the configuration.")
+            raise ValueError("SEC_API_KEY is not set in the configuration.")
             
         if not cik:
             if ticker:
@@ -925,8 +919,8 @@ class SECDataSource(BaseDataSource):
         ticker = params.get('ticker')
         
         if not SEC_API_KEY:
-            logger.error("SEC_API_KEY is not set in the environment.")
-            raise ValueError("SEC_API_KEY is not set in the environment.")
+            logger.error("SEC_API_KEY is not set in the configuration.")
+            raise ValueError("SEC_API_KEY is not set in the configuration.")
             
         if not cik:
             if ticker:
@@ -1071,8 +1065,8 @@ class SECDataSource(BaseDataSource):
         ticker = params.get('ticker')
         
         if not SEC_API_KEY:
-            logger.error("SEC_API_KEY is not set in the environment.")
-            raise ValueError("SEC_API_KEY is not set in the environment.")
+            logger.error("SEC_API_KEY is not set in the configuration.")
+            raise ValueError("SEC_API_KEY is not set in the configuration.")
             
         if not cik:
             if ticker:
@@ -1218,13 +1212,13 @@ if __name__ == '__main__':
     
     # Set up command-line argument parsing for worker configuration
     parser = argparse.ArgumentParser(description="SEC Batch Worker Entrypoint")
-    parser.add_argument('--queue', type=str, default='sec_batch', 
-                        help='RQ queue name to listen on (default: sec_batch)')
-    parser.add_argument('--metrics-port', type=int, default=8001, 
-                        help='Port to serve Prometheus metrics on (default: 8001)')
-    parser.add_argument('--log-level', type=str, default='INFO', 
+    parser.add_argument('--queue', type=str, default=settings.QUEUE_NAME, 
+                        help=f'RQ queue name to listen on (default: {settings.QUEUE_NAME})')
+    parser.add_argument('--metrics-port', type=int, default=settings.METRICS_PORT, 
+                        help=f'Port to serve Prometheus metrics on (default: {settings.METRICS_PORT})')
+    parser.add_argument('--log-level', type=str, default=settings.LOG_LEVEL, 
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
-                        help='Logging level (default: INFO)')
+                        help=f'Logging level (default: {settings.LOG_LEVEL})')
     args = parser.parse_args()
     
     # Configure logging level from command line argument
@@ -1234,7 +1228,7 @@ if __name__ == '__main__':
         logger.setLevel(numeric_level)
     
     # Start Prometheus metrics server if enabled for monitoring in containerized environments
-    if PROMETHEUS_ENABLED:
+    if PROMETHEUS_ENABLED and settings.PROMETHEUS_ENABLED:
         try:
             # Start HTTP server for Prometheus metrics
             # This enables monitoring systems to scrape operational metrics

@@ -71,10 +71,13 @@ from typing import Dict, Any, List, Optional
 
 # Import data source implementations
 from data_acquisition.sec_client import SECDataSource
-from data_acquisition.yahoo_client import YahooDataSource
+from data_acquisition.yahoo import YahooDataSource
 
 # Import utility functions for Redis key management, logging, and envelope handling
 from data_acquisition.utils import get_job_redis_key, log_job_status, normalize_envelope, get_source_key, JsonLogger
+
+# Import settings from root config
+from config import settings
 
 # Try to import optional modules
 try:
@@ -101,15 +104,15 @@ logger = logging.getLogger("async_worker")
 json_logger = JsonLogger("worker_json")
 
 # Redis connection
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+REDIS_URL = settings.redis.url
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 # Concurrency limits
-WORKER_CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "10"))
+WORKER_CONCURRENCY = settings.worker.concurrency
 
 # Message bus configuration
-SEC_TOPIC = os.getenv("SEC_TOPIC", "data.sec")  # Topic for SEC data
-YAHOO_TOPIC = os.getenv("YAHOO_TOPIC", "data.yahoo")  # Topic for Yahoo data
+SEC_TOPIC = settings.message_bus.sec_topic  # Topic for SEC data
+YAHOO_TOPIC = settings.message_bus.yahoo_topic  # Topic for Yahoo data
 
 # Optional message bus publisher
 try:

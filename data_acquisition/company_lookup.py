@@ -25,7 +25,7 @@ import time
 from typing import Dict, Any, List, Optional, Union
 
 # Import configuration and utilities
-from data_acquisition.config import settings
+from config import settings
 from data_acquisition.utils import timestamp_now, mask_sensitive, JsonLogger
 
 # Configure logging
@@ -172,7 +172,7 @@ class CompanyLookup:
         
         # Verify API key is available
         if not self.sec_api_key:
-            error_msg = "SEC_API_KEY is not set in the environment."
+            error_msg = "SEC_API_KEY is not set in the configuration."
             logger.error(error_msg)
             raise CompanyLookupException(error_msg)
         
@@ -258,7 +258,7 @@ class CompanyLookup:
         
         # Verify API key is available
         if not self.sec_api_key:
-            error_msg = "SEC_API_KEY is not set in the environment."
+            error_msg = "SEC_API_KEY is not set in the configuration."
             logger.error(error_msg)
             raise CompanyLookupException(error_msg)
         
@@ -312,7 +312,7 @@ class CompanyLookup:
         """
         # Verify API key is available
         if not self.sec_api_key:
-            error_msg = "SEC_API_KEY is not set in the environment."
+            error_msg = "SEC_API_KEY is not set in the configuration."
             logger.error(error_msg)
             raise CompanyLookupException(error_msg)
         
@@ -490,7 +490,7 @@ class CompanyLookup:
         
         # Verify API key is available
         if not self.sec_api_key:
-            error_msg = "SEC_API_KEY is not set in the environment."
+            error_msg = "SEC_API_KEY is not set in the configuration."
             logger.error(error_msg)
             raise CompanyLookupException(error_msg)
         

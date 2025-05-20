@@ -26,7 +26,7 @@ import time
 from typing import Dict, Any, List, Optional
 
 # Import from internal modules
-from data_acquisition.config import settings
+from config import settings
 from data_acquisition.sec_client import BaseDataSource, MessageBusPublisher
 from data_acquisition.utils import normalize_envelope, timestamp_now
 
