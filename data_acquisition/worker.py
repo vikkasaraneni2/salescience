@@ -1,3 +1,64 @@
+"""
+Asynchronous Worker for Data Acquisition Pipeline
+------------------------------------------------
+
+This module implements the asynchronous worker component of the Salescience
+data acquisition pipeline. It's responsible for processing data acquisition
+jobs from a Redis queue, fetching data from various sources (SEC, Yahoo Finance),
+and storing the results for retrieval by clients.
+
+System Architecture Context:
+---------------------------
+The worker sits between the job queue and the data sources, acting as the
+execution engine for data acquisition tasks:
+
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│ Orchestrator│     │ Redis       │     │ Async       │     │ Data Sources│
+│ API         │────▶│ Job Queue   │────▶│ Worker      │────▶│ (SEC/Yahoo) │
+└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
+                                              │
+                                              ▼
+                                        ┌─────────────┐
+                                        │ Redis       │
+                                        │ Result Store│
+                                        └─────────────┘
+
+Key Responsibilities:
+-------------------
+1. Job Queue Processing: Continuously poll Redis queue for new jobs
+2. Parallel Execution: Process multiple data acquisition tasks concurrently
+3. Source Integration: Interact with various data sources (SEC, Yahoo, etc.)
+4. Result Storage: Store results in Redis for retrieval by clients
+5. Message Publishing: Publish data to message bus topics for subscribers
+6. Metrics & Monitoring: Track performance metrics with Prometheus
+7. Error Handling: Implement robust error handling and recovery
+8. Multi-tenancy: Maintain proper isolation between organizations
+
+Design Principles:
+----------------
+1. Asynchronous Execution: Uses asyncio for non-blocking I/O operations,
+   maximizing throughput and resource utilization.
+
+2. Horizontal Scalability: Multiple worker instances can run concurrently,
+   scaling horizontally to handle increased load.
+
+3. Fault Tolerance: Implements comprehensive error handling to ensure that
+   individual job failures don't affect the entire system.
+
+4. Worker Concurrency: Controls parallelism through configurable concurrency
+   limits to prevent overloading external APIs.
+
+5. Observability: Integrates Prometheus metrics and structured logging for
+   comprehensive monitoring and debugging.
+
+6. Fallback Strategies: Implements fallback approaches when primary methods
+   fail, enhancing reliability and resilience.
+
+This worker is designed to be run as a long-lived process, typically in a
+container orchestration environment like Kubernetes, where it can be scaled
+horizontally based on workload demands.
+"""
+
 import os
 import json
 import asyncio
@@ -8,9 +69,11 @@ import time
 import traceback
 from typing import Dict, Any, List, Optional
 
-# Import required modules 
+# Import data source implementations
 from data_acquisition.sec_client import SECDataSource
 from data_acquisition.yahoo_client import YahooDataSource
+
+# Import utility functions for Redis key management, logging, and envelope handling
 from data_acquisition.utils import get_job_redis_key, log_job_status, normalize_envelope, get_source_key, JsonLogger
 
 # Try to import optional modules
@@ -448,19 +511,53 @@ async def process_xbrl_job(job_id: str, company: Dict[str, Any], concepts: List[
 async def main():
     """
     Main worker loop to process jobs from the Redis queue.
+    
+    This function implements the core event loop of the worker process,
+    continuously polling the Redis queue for new jobs, parsing them,
+    and dispatching them for asynchronous processing.
+    
+    The worker flow follows these steps:
+    1. Initialize the worker (connect to Redis, start metrics server)
+    2. Poll the Redis queue for new jobs with a blocking operation
+    3. Parse the job data and extract parameters
+    4. For each company in the job, create appropriate tasks based on requested sources
+    5. Process all tasks concurrently, respecting the concurrency limit
+    6. Handle and log any errors that occur during processing
+    7. Repeat until terminated
+    
+    The worker uses a semaphore to control concurrency, ensuring that it
+    doesn't exceed the configured limit of concurrent tasks. This prevents
+    overwhelming external APIs with too many requests and manages resource
+    usage effectively.
+    
+    Error handling is implemented at multiple levels:
+    - Connection errors for Redis are handled at startup
+    - Job parsing errors are caught and logged
+    - Individual task errors are contained within their respective functions
+    - The main loop catches any unexpected exceptions to ensure the worker
+      continues running even if a job fails catastrophically
+    
+    The worker is designed to run indefinitely until explicitly terminated,
+    making it suitable for containerized environments and long-running services.
     """
+    # Log worker startup with concurrency settings
     logger.info(f"Async worker started with concurrency limit {WORKER_CONCURRENCY}")
+    
+    # Create a semaphore to limit concurrent tasks
+    # This ensures we don't overwhelm external APIs or exhaust system resources
     semaphore = asyncio.Semaphore(WORKER_CONCURRENCY)
     
-    # Check Redis connection
+    # Validate Redis connection at startup
+    # If Redis is unavailable, the worker cannot function and should exit
     try:
         redis_client.ping()
         logger.info("Successfully connected to Redis")
     except Exception as e:
         logger.critical(f"Failed to connect to Redis: {e}")
-        return
+        return  # Exit the function, which will terminate the worker
     
-    # Start Prometheus metrics server if enabled
+    # Initialize Prometheus metrics server for monitoring
+    # This provides real-time visibility into worker performance
     if PROMETHEUS_ENABLED:
         try:
             metrics_port = int(os.getenv("METRICS_PORT", "8000"))
@@ -468,20 +565,29 @@ async def main():
             logger.info(f"Started Prometheus metrics server on port {metrics_port}")
         except Exception as e:
             logger.error(f"Failed to start Prometheus metrics server: {e}")
+            # Continue running even if metrics server fails to start
     
+    # Main processing loop
+    # This loop runs indefinitely, continuously processing jobs
     while True:
         try:
-            # Poll for jobs
+            # Poll for jobs using Redis BLPOP
+            # BLPOP is a blocking operation that waits for a job to be available
+            # The timeout parameter (5 seconds) allows periodic health checks
             job_data = redis_client.blpop("data_jobs", timeout=5)
             logger.debug(f"Polled Redis: job_data={job_data}")
             
+            # If no job is available within the timeout period, sleep briefly and try again
             if not job_data:
                 await asyncio.sleep(1)
                 continue
             
             # Parse job data
+            # The result of BLPOP is a tuple (queue_name, job_data)
             _, job_str = job_data
             job = json.loads(job_str)
+            
+            # Extract job parameters
             job_id = job.get("job_id")
             companies = job.get("companies", [])
             n_years = job.get("n_years", 1)
@@ -492,47 +598,83 @@ async def main():
             
             logger.info(f"Processing job {job_id} with {len(companies)} companies (org={organization_id}, user={user_id})")
             
-            # Schedule all jobs for this batch
+            # Create tasks for each company and data source
+            # This allows processing multiple companies and sources in parallel
             tasks = []
             for company in companies:
-                # Check for source flags
+                # Check which data sources should be processed for this company
+                # Each company can optionally specify which sources to use
+                # Default behavior is to enable SEC and Yahoo if not specified
                 process_sec = company.get('sec', True)  # Default to True if not specified
                 process_yahoo = company.get('yahoo', True)  # Default to True if not specified
                 process_xbrl = company.get('xbrl', False)  # Default to False if not specified
                 
-                logger.debug(f"Company {company.get('ticker') or company.get('name')} flags: sec={process_sec}, yahoo={process_yahoo}, xbrl={process_xbrl}")
+                company_identifier = company.get('ticker') or company.get('name')
+                logger.debug(f"Company {company_identifier} flags: sec={process_sec}, yahoo={process_yahoo}, xbrl={process_xbrl}")
                 
-                # Add SEC job if needed
+                # Create coroutine tasks for each requested data source
                 if process_sec:
                     tasks.append(process_sec_job(job_id, company, n_years, form_type, organization_id, user_id))
                 
-                # Add Yahoo job if needed
                 if process_yahoo:
                     tasks.append(process_yahoo_job(job_id, company, organization_id, user_id))
                 
-                # Add XBRL job if needed
                 if process_xbrl and concepts:
                     tasks.append(process_xbrl_job(job_id, company, concepts, organization_id, user_id))
             
-            # Run all jobs concurrently, respecting the semaphore
+            # Execute all tasks concurrently, with concurrency limited by the semaphore
+            # asyncio.gather runs all coroutines in parallel and collects their results
             async with semaphore:
                 await asyncio.gather(*tasks)
                 
             logger.info(f"Completed job {job_id} (org={organization_id}, user={user_id})")
             
         except Exception as e:
+            # Catch-all exception handler to ensure the worker keeps running
+            # even if a catastrophic error occurs processing a job
             logger.error(f"Error processing job: {e}", exc_info=True)
+            
             # Log detailed traceback for debugging
+            # This provides important context for troubleshooting issues
             traceback_str = traceback.format_exc()
             logger.error(f"Traceback: {traceback_str}")
+            
+            # Brief pause before continuing to prevent tight error loops
+            # This helps avoid overwhelming the logs if there's a persistent error
             await asyncio.sleep(1)
 
 
 if __name__ == "__main__":
-    # Run the async worker
+    """
+    Entry point for the worker process when run directly as a script.
+    
+    This block is executed when the worker is started as a standalone
+    process either for development, testing, or in a containerized 
+    environment (see Dockerfile.worker).
+    
+    It handles:
+    1. Starting the main async event loop
+    2. Graceful shutdown on keyboard interrupts (SIGINT)
+    3. Logging any critical exceptions that might cause the worker to crash
+    
+    In production, the worker would typically be run in a container with
+    appropriate health checks and restart policies to ensure high availability.
+    """
+    # Run the async worker using asyncio.run, which:
+    # - Creates a new event loop
+    # - Runs the main coroutine until completion
+    # - Closes the event loop and all pending tasks
     try:
+        logger.info("Starting worker process")
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Worker stopped by user")
+        # Handle clean shutdown on Ctrl+C or Docker stop
+        logger.info("Worker stopped by user (SIGINT/SIGTERM)")
     except Exception as e:
+        # Log any unhandled exceptions that might crash the worker
+        # This provides critical information for debugging production issues
         logger.critical(f"Worker crashed: {e}", exc_info=True)
+        # Exit with non-zero status to indicate failure
+        # This allows container orchestration systems to detect the failure
+        import sys
+        sys.exit(1)

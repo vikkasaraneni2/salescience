@@ -1,19 +1,22 @@
-import os
-import httpx
-import logging
-import datetime
-import asyncio
-import redis
-import json
-from typing import Dict, Any, List, Optional
-from abc import ABC, abstractmethod
-import time
+import os               # Operating system interfaces (environment variables, file paths)
+import httpx            # HTTP client library (modern alternative to requests)
+import logging          # Standard logging system
+import datetime         # Date and time utilities
+import asyncio          # Asynchronous I/O, event loop, and concurrency tools
+import redis            # Redis client for message bus and job queue implementation
+import json             # JSON parsing and serialization
+import time             # Time access and conversions
+from typing import Dict, Any, List, Optional  # Type annotations
+from abc import ABC, abstractmethod           # Abstract base classes
 
-# Configure logging
+# Configure logging for the entire module
+# This sets up console logging with timestamps and log levels
+# Format: [2023-01-01 12:00:00] INFO sec_client: Log message here
 logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s %(name)s: %(message)s'
+    level=logging.INFO,  # Log INFO and above (INFO, WARNING, ERROR, CRITICAL)
+    format='[%(asctime)s] %(levelname)s %(name)s: %(message)s'  # Timestamp, level, logger name, message
 )
+# Get logger specific to this module - all logs will show "sec_client" as the source
 logger = logging.getLogger("sec_client")
 
 # Environment variables
@@ -76,9 +79,25 @@ class BaseDataSource(ABC):
 
 class MessageBusPublisher:
     """
-    Message bus publisher using Redis Streams.
+    Message bus publisher using Redis Streams for event-driven architecture.
+    
     This class provides a simple interface to publish data acquisition envelopes
     to a Redis stream (topic) for downstream processing, storage, or analytics.
+    It implements a lightweight publish-subscribe pattern to decouple data acquisition
+    from processing and storage concerns.
+    
+    Redis Streams are used as the underlying transport mechanism, providing:
+    - Durable message storage with configurable retention
+    - Consumer groups for work distribution and parallel processing
+    - Message acknowledgments for reliable delivery
+    - Time-based message ordering
+    - Efficient appends-only data structure optimized for high throughput
+    
+    Usage patterns:
+    1. One-to-many broadcasting of acquisition results
+    2. Work distribution across multiple processing nodes
+    3. Event sourcing for system state reconstruction
+    4. Audit trail of all acquired data
     """
     def __init__(self, redis_url=REDIS_URL):
         # Initialize the Redis client
@@ -104,13 +123,25 @@ def get_job_redis_key(organization_id: Optional[str], job_id: str, key_type: str
     """
     Creates a Redis key with organization prefix for proper namespace isolation.
     
+    This function enforces a consistent key naming convention across the application,
+    ensuring proper multi-tenancy support and namespace isolation between different
+    organizations using the system. It's used for job status tracking, results storage,
+    and other Redis-based data structures.
+    
+    Key format: "org:{organization_id}:job:{job_id}:{key_type}"
+    If no organization is provided: "job:{job_id}:{key_type}"
+    
     Args:
-        organization_id: The organization ID for namespacing
-        job_id: The unique job identifier
+        organization_id: The organization ID for namespacing (tenant identifier)
+        job_id: The unique job identifier (typically a UUID)
         key_type: Type of key (status, result, overall_status, etc.)
     
     Returns:
         Properly formatted Redis key with organization prefix
+        
+    Example:
+        get_job_redis_key("acme-corp", "550e8400-e29b-41d4-a716-446655440000", "status")
+        # Returns: "org:acme-corp:job:550e8400-e29b-41d4-a716-446655440000:status"
     """
     if not organization_id:
         logger.warning(f"No organization_id provided for Redis key (job={job_id}, type={key_type})")
@@ -120,17 +151,25 @@ def get_job_redis_key(organization_id: Optional[str], job_id: str, key_type: str
 
 def get_cik_for_ticker(ticker: str) -> str:
     """
-    Resolves a ticker symbol to a CIK using the sec-api.io mapping endpoint.
-    Returns the CIK as a zero-padded string, or raises ValueError if not found.
+    Resolves a ticker symbol to a CIK (Central Index Key) using the sec-api.io mapping endpoint.
+    
+    The CIK is a unique identifier assigned by the SEC to companies and individuals who
+    file disclosures with the SEC. This function provides the essential mapping between
+    common stock ticker symbols (e.g., AAPL) and their corresponding SEC identifiers,
+    which are required for accessing SEC EDGAR filings and data.
+    
+    The function performs proper error handling and logging, and returns the CIK in the
+    standard SEC format (10-digit zero-padded string).
     
     Args:
-        ticker: The stock ticker symbol (e.g., 'AAPL')
+        ticker: The stock ticker symbol (e.g., 'AAPL', 'MSFT', 'GOOGL')
         
     Returns:
-        Zero-padded CIK string (e.g., '0000320193')
+        Zero-padded CIK string (e.g., '0000320193' for Apple Inc.)
         
     Raises:
-        ValueError: If ticker can't be resolved or API error occurs
+        ValueError: If ticker can't be resolved, no SEC_API_KEY is available,
+                  or another API error occurs
     """
     if not SEC_API_KEY:
         error_msg = "SEC_API_KEY is not set in the environment."
@@ -182,6 +221,27 @@ def get_cik_for_ticker(ticker: str) -> str:
 class SECDataSource(BaseDataSource):
     """
     Data source for SEC filings using the sec-api.io service.
+    
+    This class provides comprehensive access to SEC EDGAR filings and data,
+    implementing the BaseDataSource interface for standardized data acquisition.
+    It offers methods for retrieving various types of SEC filings and financial data,
+    with robust error handling, logging, and telemetry.
+    
+    Key capabilities:
+    - Fetching annual reports (10-K)
+    - Fetching quarterly reports (10-Q)
+    - Retrieving material events (8-K)
+    - Accessing insider trading filings (Form 4)
+    - Extracting structured financial data (XBRL)
+    - Multi-year historical data retrieval
+    - Support for both ticker symbol and CIK-based queries
+    - Integration with message bus for event-driven architectures
+    
+    The class implements advanced features for reliability:
+    - Multiple fallback strategies for document retrieval
+    - Comprehensive error handling and reporting
+    - Detailed logging for operational visibility
+    - Optional Prometheus metrics for monitoring
     """
     
     def __init__(self):
@@ -527,15 +587,23 @@ class SECDataSource(BaseDataSource):
     
     def fetch_last_n_years(self, params: Dict[str, Any], n_years: int = 5, form_type: str = '10-K') -> List[Dict[str, Any]]:
         """
-        Fetch filings for the last N years.
+        Fetch filings for the last N years for a specific company.
+        
+        This method retrieves SEC filings (default: 10-K annual reports) for the specified 
+        number of years, attempting to get one filing per year. It handles all the 
+        complexity of finding and retrieving these documents from multiple potential
+        sources, with fallback options for reliability.
         
         Args:
-            params: Base parameters for fetch method
-            n_years: Number of years to fetch
-            form_type: Form type to fetch
+            params: Base parameters for fetch method, must include either 'cik' or 'ticker'
+            n_years: Number of years to fetch, defaults to 5 years of historical data
+            form_type: Form type to fetch (e.g., '10-K', '10-Q', '8-K', etc.)
             
         Returns:
-            List of fetch results, one per year
+            List of fetch results, with one envelope per year where available.
+            Each envelope contains filing content and comprehensive metadata.
+            If a filing isn't available for a particular year, the envelope will
+            have status='error' or status='not_found' with appropriate error details.
         """
         results = []
         current_year = datetime.datetime.now().year
@@ -800,12 +868,22 @@ class SECDataSource(BaseDataSource):
         """
         Fetches the last N years of filings and publishes each envelope to the message bus.
         
+        This asynchronous method facilitates integration with event-driven architectures
+        by fetching multiple years of SEC filings and publishing them to a Redis-based
+        message bus. It handles the entire flow from data retrieval to publication,
+        with proper error logging.
+        
         Args:
             params (Dict[str, Any]): Parameters for fetching filings (ticker or cik, etc.)
             n_years (int): Number of years of filings to fetch
             form_type (str): SEC form type (e.g., '10-K')
             publisher (MessageBusPublisher): Instance of the message bus publisher
             topic (str): Name of the Redis stream/topic to publish to
+            
+        Note:
+            This method is designed to be awaited in an asyncio event loop. It will
+            perform the fetch operation synchronously (which can be slow for multiple years),
+            but it allows the caller to continue with other async operations.
         """
         try:
             logger.info(f"Starting fetch_last_n_years_and_publish for params={params}, n_years={n_years}, form_type={form_type}")
@@ -820,12 +898,24 @@ class SECDataSource(BaseDataSource):
         """
         Fetches the most recent Form 4 (insider trading) filings for a company.
         
+        Form 4 filings report changes in ownership of company securities by insiders
+        (directors, officers, and beneficial owners of more than 10% of a class of securities).
+        This method retrieves these filings to provide visibility into insider trading
+        activities, which can be valuable signals for company performance and sentiment.
+        
         Args:
             params (Dict[str, Any]): Must include 'cik' or 'ticker'.
             limit (int): Maximum number of filings to return (default 10)
             
         Returns:
             List[Dict[str, Any]]: List of envelopes with Form 4 data and metadata.
+            Each envelope contains:
+                - content: The raw filing document (HTML or XML)
+                - content_type: The format of the content ('html' or 'xml')
+                - source: 'sec-form4'
+                - status: 'success' or error status
+                - metadata: Comprehensive filing metadata including filing date,
+                  accession number, CIK, ticker, and source URL
             
         Example usage:
             sec = SECDataSource()
@@ -941,16 +1031,41 @@ class SECDataSource(BaseDataSource):
         """
         Fetches a specific XBRL fact (e.g., us-gaap:Revenues) for a company using sec-api.io.
         
+        XBRL (eXtensible Business Reporting Language) is a structured data format that standardizes
+        financial reporting elements. This method accesses specific financial data points
+        in XBRL format, allowing for consistent extraction of standardized financial metrics
+        across companies and time periods. This is particularly valuable for quantitative
+        analysis and financial modeling.
+        
         Args:
             params (Dict[str, Any]): Must include 'cik' or 'ticker'.
-            concept (str): XBRL concept/tag (e.g., 'us-gaap:Revenues').
+            concept (str): XBRL concept/tag (e.g., 'us-gaap:Revenues', 'us-gaap:NetIncomeLoss',
+                          'us-gaap:Assets', 'us-gaap:Liabilities').
             
         Returns:
             Dict[str, Any]: Envelope with XBRL fact data and metadata.
+            The returned envelope contains:
+                - content: A dictionary with the XBRL fact data, typically including
+                  values across multiple reporting periods
+                - content_type: 'json'
+                - source: 'sec-xbrl'
+                - status: 'success' or error status
+                - metadata: Information about the request including CIK, ticker,
+                  concept name, and retrieval timestamp
             
         Example usage:
             sec = SECDataSource()
             result = sec.fetch_xbrl_fact({'ticker': 'AAPL'}, 'us-gaap:Revenues')
+            
+        Note:
+            Common XBRL concepts include:
+            - us-gaap:Revenues - Total revenue
+            - us-gaap:NetIncomeLoss - Net income/loss
+            - us-gaap:Assets - Total assets
+            - us-gaap:Liabilities - Total liabilities
+            - us-gaap:StockholdersEquity - Shareholders' equity
+            - us-gaap:EarningsPerShareBasic - Basic EPS
+            - us-gaap:OperatingIncomeLoss - Operating income
         """
         cik = params.get('cik')
         ticker = params.get('ticker')
@@ -1001,12 +1116,29 @@ class SECDataSource(BaseDataSource):
             raise ValueError(f"Error fetching XBRL fact from SEC API: {e}")
 
 
-# Job queue integration
+# Job queue integration for distributed processing
 def process_sec_batch_job(batch_params, n_years, form_type, topic):
     """
     Job handler for SEC batch jobs. Fetches filings for all companies in batch_params
     and publishes each envelope to the message bus. Tracks Prometheus metrics for
     job count, failures, and duration.
+    
+    This function serves as the entry point for distributed batch processing of SEC filings
+    for multiple companies. It's designed to be executed as an RQ (Redis Queue) worker task,
+    allowing for scalable, parallel processing of data acquisition jobs.
+    
+    Key features:
+    - Handles batches of companies (multiple tickers/CIKs) in a single job
+    - Publishes results to a Redis stream for downstream processing
+    - Includes instrumentation with Prometheus metrics if enabled
+    - Provides detailed logging of job status and performance
+    - Implements robust error handling at both the batch and individual company levels
+    
+    Args:
+        batch_params: List of company parameter dictionaries, each with 'ticker' or 'cik'
+        n_years: Number of years of filings to fetch per company
+        form_type: SEC form type to fetch (e.g., '10-K', '10-Q')
+        topic: Redis stream name to publish results to
     """
     if PROMETHEUS_ENABLED:
         SEC_JOB_COUNT.inc()
@@ -1046,8 +1178,25 @@ def run_sec_batch_worker(queue_name='sec_batch'):
     Starts an RQ worker that listens for SEC batch jobs on the specified queue.
     Jobs should be enqueued with process_sec_batch_job as the function.
     
+    This function initializes and runs a worker process that continuously monitors
+    a Redis queue for SEC data acquisition jobs. It's designed to be used either
+    as a long-running service in a containerized environment (e.g., Kubernetes pod)
+    or as a standalone process for development and testing.
+    
+    Worker process flow:
+    1. Connects to the Redis server specified by REDIS_URL
+    2. Creates an RQ Worker instance listening on the specified queue
+    3. Enters a loop to process jobs as they arrive in the queue
+    4. For each job, executes the job function (e.g., process_sec_batch_job)
+    5. Handles failures, retries, and monitoring
+    
     Args:
-        queue_name: Name of the Redis queue to listen on
+        queue_name: Name of the Redis queue to listen on (default: 'sec_batch')
+        
+    Note:
+        This function will block indefinitely while processing jobs. It's designed
+        to be run in its own process or container. To stop the worker, send a SIGTERM
+        signal, which RQ handles gracefully to finish current jobs before shutting down.
     """
     if not RQ_ENABLED:
         logger.error("RQ is not installed. Cannot run worker.")
@@ -1063,25 +1212,43 @@ def run_sec_batch_worker(queue_name='sec_batch'):
         logger.error(f"[RQ Worker] Error starting worker: {e}")
 
 
-# Containerization support
+# Containerization support - CLI entry point for Docker/Kubernetes deployment
 if __name__ == '__main__':
     import argparse
     
+    # Set up command-line argument parsing for worker configuration
     parser = argparse.ArgumentParser(description="SEC Batch Worker Entrypoint")
-    parser.add_argument('--queue', type=str, default='sec_batch', help='RQ queue name to listen on (default: sec_batch)')
-    parser.add_argument('--metrics-port', type=int, default=8001, help='Port to serve Prometheus metrics on (default: 8001)')
+    parser.add_argument('--queue', type=str, default='sec_batch', 
+                        help='RQ queue name to listen on (default: sec_batch)')
+    parser.add_argument('--metrics-port', type=int, default=8001, 
+                        help='Port to serve Prometheus metrics on (default: 8001)')
+    parser.add_argument('--log-level', type=str, default='INFO', 
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                        help='Logging level (default: INFO)')
     args = parser.parse_args()
     
-    # Start Prometheus metrics server if enabled
+    # Configure logging level from command line argument
+    numeric_level = getattr(logging, args.log_level.upper(), None)
+    if numeric_level:
+        logging.getLogger().setLevel(numeric_level)
+        logger.setLevel(numeric_level)
+    
+    # Start Prometheus metrics server if enabled for monitoring in containerized environments
     if PROMETHEUS_ENABLED:
         try:
+            # Start HTTP server for Prometheus metrics
+            # This enables monitoring systems to scrape operational metrics
             start_http_server(args.metrics_port)
             logger.info(f"Prometheus metrics server started on port {args.metrics_port}")
         except Exception as e:
             logger.error(f"Failed to start Prometheus metrics server: {e}")
     
-    # Start worker
+    # Start worker process - this will block and process jobs from the queue
     if RQ_ENABLED:
+        logger.info(f"Starting SEC data acquisition worker, listening on queue '{args.queue}'")
         run_sec_batch_worker(args.queue)
     else:
-        logger.error("RQ is not installed. Cannot run worker.")
+        logger.error("RQ is not installed. Cannot run worker. Please install 'rq' package.")
+        # Exit with error code to signal failure in containerized environments
+        import sys
+        sys.exit(1)
