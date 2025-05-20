@@ -1,4 +1,3 @@
-import os               # Operating system interfaces (environment variables, file paths)
 import httpx            # HTTP client library (modern alternative to requests)
 import logging          # Standard logging system
 import datetime         # Date and time utilities
@@ -10,42 +9,48 @@ from typing import Dict, Any, List, Optional  # Type annotations
 from abc import ABC, abstractmethod           # Abstract base classes
 from config import settings  # Centralized configuration
 
-# Configure logging for the entire module
-# This sets up console logging with timestamps and log levels
-# Format: [2023-01-01 12:00:00] INFO sec_client: Log message here
-logging.basicConfig(
-    level=logging.INFO,  # Log INFO and above (INFO, WARNING, ERROR, CRITICAL)
-    format='[%(asctime)s] %(levelname)s %(name)s: %(message)s'  # Timestamp, level, logger name, message
-)
-# Get logger specific to this module - all logs will show "sec_client" as the source
-logger = logging.getLogger("sec_client")
+# Get centralized logging configuration
+from data_acquisition.utils import configure_logging
 
-# Get API key and Redis URL from centralized settings
-SEC_API_KEY = settings.api_keys.SEC_API_KEY
-REDIS_URL = settings.redis.URL
+# Get logger specific to this module
+logger = configure_logging("sec_client")
 
-# SEC API configuration
-SEC_API_BASE_URL = settings.service_urls.SEC_API_BASE_URL
-SEC_EDGAR_BASE_URL = settings.service_urls.SEC_EDGAR_BASE_URL
+# Core configuration constants from centralized settings
+# These constants maintain consistent naming throughout the codebase
+# while sourcing their values from the centralized configuration system
+SEC_API_KEY = settings.api_keys.sec
+REDIS_URL = settings.redis.url
+
+# SEC API endpoint configuration from centralized settings
+# Using standardized URLs ensures consistent communication with external services
+SEC_API_BASE_URL = settings.service_urls.sec_api_base
+SEC_EDGAR_BASE_URL = settings.service_urls.sec_edgar_base
 
 # Optional: Prometheus metrics for observability
+# Controlled by settings.prometheus_enabled in the centralized configuration
 try:
     from prometheus_client import Counter, Histogram, start_http_server
+    # Define standard metrics for SEC job processing
     SEC_JOB_COUNT = Counter('sec_job_count', 'Total number of SEC batch jobs processed')
     SEC_JOB_FAILURES = Counter('sec_job_failures', 'Total number of failed SEC batch jobs')
     SEC_JOB_DURATION = Histogram('sec_job_duration_seconds', 'Duration of SEC batch jobs in seconds')
+    # Local flag to track successful import - will be combined with settings.prometheus_enabled
     PROMETHEUS_ENABLED = True
 except ImportError:
     logger.warning("prometheus_client not installed, metrics will not be available")
     PROMETHEUS_ENABLED = False
+    # Even if prometheus is enabled in settings, we can't use it without the library
 
-# Optional: Redis Queue (RQ) for job processing
+# Optional: Redis Queue (RQ) for job processing 
+# Uses REDIS_URL from centralized settings when enabled
 try:
     from rq import Queue, Worker
+    # Feature flag to indicate RQ functionality is available
     RQ_ENABLED = True
 except ImportError:
     logger.warning("rq not installed, job queue processing will not be available")
     RQ_ENABLED = False
+    # Distributed job processing won't be available without RQ
 
 
 class BaseDataSource(ABC):
@@ -94,7 +99,8 @@ class MessageBusPublisher:
     4. Audit trail of all acquired data
     """
     def __init__(self, redis_url=REDIS_URL):
-        # Initialize the Redis client
+        # Initialize the Redis client using centralized configuration
+        # Default uses REDIS_URL from settings but allows override for testing
         self.client = redis.Redis.from_url(redis_url)
     
     def publish(self, topic: str, envelope: dict):
@@ -166,8 +172,9 @@ def get_cik_for_ticker(ticker: str) -> str:
                   or another API error occurs
     """
     if not SEC_API_KEY:
-        error_msg = "SEC_API_KEY is not set in the configuration."
+        error_msg = "SEC_API_KEY is not set in the centralized configuration (settings.api_keys.sec)."
         logger.error(error_msg)
+        # Provide clear error with configuration guidance
         raise ValueError(error_msg)
     
     # Correct endpoint format based on SEC-API.io documentation
@@ -242,9 +249,9 @@ class SECDataSource(BaseDataSource):
         """Initialize the SEC data source."""
         self.name = "SEC"
         
-        # Verify API key is available
+        # Verify API key is available from centralized configuration
         if not SEC_API_KEY:
-            logger.warning("SEC_API_KEY not set. SEC data source will not function.")
+            logger.warning("SEC_API_KEY not set in settings.api_keys.sec. SEC data source will not function.")
     
     def fetch(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -285,15 +292,16 @@ class SECDataSource(BaseDataSource):
         
         logger.info(f"Fetching SEC filing: ticker={ticker}, cik={cik}, form_type={form_type}, year={year}")
         
-        # Verify API key is available
+        # Verify API key is available from centralized configuration
         if not SEC_API_KEY:
-            error_msg = "SEC_API_KEY is not set in the configuration."
+            error_msg = "SEC_API_KEY is not set in the centralized configuration (settings.api_keys.sec)."
             logger.error(error_msg)
+            # Provide clear error with configuration guidance
             raise ValueError(error_msg)
             
         # Log user agent and contact info for SEC compliance
         headers = {
-            "User-Agent": settings.SEC_USER_AGENT,
+            "User-Agent": settings.sec_user_agent,
             "Accept": "application/json",
         }
         
@@ -477,8 +485,10 @@ class SECDataSource(BaseDataSource):
         ticker = params.get('ticker')
         
         if not SEC_API_KEY:
-            logger.error("SEC_API_KEY is not set in the configuration.")
-            raise ValueError("SEC_API_KEY is not set in the configuration.")
+            error_msg = "SEC_API_KEY is not set in the centralized configuration (settings.api_keys.sec)."
+            logger.error(error_msg)
+            # Provide clear error with configuration guidance
+            raise ValueError(error_msg)
             
         if not cik:
             if ticker:
@@ -500,7 +510,7 @@ class SECDataSource(BaseDataSource):
         }
         
         headers = {
-            "User-Agent": os.getenv("SEC_USER_AGENT", "salescience/1.0"),
+            "User-Agent": settings.sec_user_agent,
             "Accept": "application/json",
         }
         
@@ -632,7 +642,7 @@ class SECDataSource(BaseDataSource):
             }
             
             headers = {
-                "User-Agent": os.getenv("SEC_USER_AGENT", "salescience/1.0"),
+                "User-Agent": settings.sec_user_agent,
                 "Accept": "application/json",
             }
             
@@ -919,8 +929,10 @@ class SECDataSource(BaseDataSource):
         ticker = params.get('ticker')
         
         if not SEC_API_KEY:
-            logger.error("SEC_API_KEY is not set in the configuration.")
-            raise ValueError("SEC_API_KEY is not set in the configuration.")
+            error_msg = "SEC_API_KEY is not set in the centralized configuration (settings.api_keys.sec)."
+            logger.error(error_msg)
+            # Provide clear error with configuration guidance
+            raise ValueError(error_msg)
             
         if not cik:
             if ticker:
@@ -942,7 +954,7 @@ class SECDataSource(BaseDataSource):
         }
         
         headers = {
-            "User-Agent": os.getenv("SEC_USER_AGENT", "salescience/1.0"),
+            "User-Agent": settings.sec_user_agent,
             "Accept": "application/json",
         }
         
@@ -1065,8 +1077,10 @@ class SECDataSource(BaseDataSource):
         ticker = params.get('ticker')
         
         if not SEC_API_KEY:
-            logger.error("SEC_API_KEY is not set in the configuration.")
-            raise ValueError("SEC_API_KEY is not set in the configuration.")
+            error_msg = "SEC_API_KEY is not set in the centralized configuration (settings.api_keys.sec)."
+            logger.error(error_msg)
+            # Provide clear error with configuration guidance
+            raise ValueError(error_msg)
             
         if not cik:
             if ticker:
@@ -1077,7 +1091,7 @@ class SECDataSource(BaseDataSource):
         xbrl_url = f"{SEC_API_BASE_URL}/xbrl/companyconcept?cik={cik.lstrip('0')}&concept={concept}&token={SEC_API_KEY}"
         try:
             headers = {
-                "User-Agent": os.getenv("SEC_USER_AGENT", "salescience/1.0"),
+                "User-Agent": settings.sec_user_agent,
                 "Accept": "application/json",
             }
             
@@ -1211,14 +1225,21 @@ if __name__ == '__main__':
     import argparse
     
     # Set up command-line argument parsing for worker configuration
+    # All default values come from the centralized configuration system
     parser = argparse.ArgumentParser(description="SEC Batch Worker Entrypoint")
-    parser.add_argument('--queue', type=str, default=settings.QUEUE_NAME, 
-                        help=f'RQ queue name to listen on (default: {settings.QUEUE_NAME})')
-    parser.add_argument('--metrics-port', type=int, default=settings.METRICS_PORT, 
-                        help=f'Port to serve Prometheus metrics on (default: {settings.METRICS_PORT})')
-    parser.add_argument('--log-level', type=str, default=settings.LOG_LEVEL, 
+    
+    # Queue name from centralized configuration (settings.queue_name)
+    parser.add_argument('--queue', type=str, default=settings.queue_name, 
+                        help=f'RQ queue name to listen on (default: {settings.queue_name} from config)')
+    
+    # Metrics port from centralized configuration (settings.metrics_port)
+    parser.add_argument('--metrics-port', type=int, default=settings.metrics_port, 
+                        help=f'Port to serve Prometheus metrics on (default: {settings.metrics_port} from config)')
+    
+    # Log level from centralized configuration (settings.log_level)
+    parser.add_argument('--log-level', type=str, default=settings.log_level, 
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
-                        help=f'Logging level (default: {settings.LOG_LEVEL})')
+                        help=f'Logging level (default: {settings.log_level} from config)')
     args = parser.parse_args()
     
     # Configure logging level from command line argument
@@ -1228,14 +1249,16 @@ if __name__ == '__main__':
         logger.setLevel(numeric_level)
     
     # Start Prometheus metrics server if enabled for monitoring in containerized environments
-    if PROMETHEUS_ENABLED and settings.PROMETHEUS_ENABLED:
+    # Uses both library availability check (PROMETHEUS_ENABLED) and feature flag (settings.prometheus_enabled)
+    if PROMETHEUS_ENABLED and settings.prometheus_enabled:
         try:
-            # Start HTTP server for Prometheus metrics
+            # Start HTTP server for Prometheus metrics using port from centralized configuration
             # This enables monitoring systems to scrape operational metrics
             start_http_server(args.metrics_port)
-            logger.info(f"Prometheus metrics server started on port {args.metrics_port}")
+            logger.info(f"Prometheus metrics server started on port {args.metrics_port} (from centralized configuration)")
         except Exception as e:
             logger.error(f"Failed to start Prometheus metrics server: {e}")
+            logger.error("Check settings.metrics_port in centralized configuration")
     
     # Start worker process - this will block and process jobs from the queue
     if RQ_ENABLED:

@@ -30,17 +30,16 @@ from config import settings
 from data_acquisition.sec_client import BaseDataSource, MessageBusPublisher
 from data_acquisition.utils import normalize_envelope, timestamp_now
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("yahoo")
+# Get centralized logging configuration
+from data_acquisition.utils import configure_logging
+
+# Get logger specific to this module
+logger = configure_logging("yahoo")
 
 # API configuration
-YAHOO_API_KEY = settings.YAHOO_API_KEY
-YAHOO_API_BASE_URL = settings.YAHOO_API_BASE_URL
-REQUEST_TIMEOUT = settings.YAHOO_REQUEST_TIMEOUT_SEC
+YAHOO_API_KEY = settings.api_keys.yahoo
+YAHOO_API_BASE_URL = settings.service_urls.yahoo_api_base
+REQUEST_TIMEOUT = settings.yahoo_request_timeout_sec
 
 # Fallback to yfinance if direct API is not available
 try:

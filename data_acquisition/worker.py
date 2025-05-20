@@ -59,7 +59,6 @@ container orchestration environment like Kubernetes, where it can be scaled
 horizontally based on workload demands.
 """
 
-import os
 import json
 import asyncio
 import logging
@@ -76,7 +75,7 @@ from data_acquisition.yahoo import YahooDataSource
 # Import utility functions for Redis key management, logging, and envelope handling
 from data_acquisition.utils import get_job_redis_key, log_job_status, normalize_envelope, get_source_key, JsonLogger
 
-# Import settings from root config
+# Import centralized configuration
 from config import settings
 
 # Try to import optional modules
@@ -93,26 +92,28 @@ except ImportError:
     PROMETHEUS_ENABLED = False
     logging.warning("prometheus_client not installed, metrics will not be available")
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("async_worker")
+# Get centralized logging configuration
+from data_acquisition.utils import configure_logging
+
+# Get logger specific to this module
+logger = configure_logging("async_worker")
 
 # Initialize JSON logger
 json_logger = JsonLogger("worker_json")
 
-# Redis connection
+# Get Redis configuration from centralized settings
 REDIS_URL = settings.redis.url
-redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
-# Concurrency limits
-WORKER_CONCURRENCY = settings.worker.concurrency
-
-# Message bus configuration
-SEC_TOPIC = settings.message_bus.sec_topic  # Topic for SEC data
-YAHOO_TOPIC = settings.message_bus.yahoo_topic  # Topic for Yahoo data
+# Initialize Redis client with configuration from settings
+redis_client = redis.Redis.from_url(
+    REDIS_URL, 
+    decode_responses=True, 
+    password=settings.redis.password,
+    ssl=settings.redis.ssl,
+    socket_timeout=settings.redis.socket_timeout,
+    socket_connect_timeout=settings.redis.socket_connect_timeout,
+    retry_on_timeout=settings.redis.retry_on_timeout
+)
 
 # Optional message bus publisher
 try:
@@ -182,8 +183,8 @@ async def process_sec_job(job_id: str, company: Dict[str, Any], n_years: int, fo
                 # Publish to message bus if enabled
                 if PUBLISH_ENABLED:
                     try:
-                        publisher.publish(SEC_TOPIC, envelope)
-                        logger.info(f"[SEC] Published {ticker or cik} filing for year {year} to {SEC_TOPIC}")
+                        publisher.publish(settings.message_bus.sec_topic, envelope)
+                        logger.info(f"[SEC] Published {ticker or cik} filing for year {year} to {settings.message_bus.sec_topic}")
                     except Exception as pub_exc:
                         logger.warning(f"[SEC] Failed to publish envelope to message bus: {pub_exc} (org={organization_id}, job={job_id})")
                 
@@ -227,8 +228,8 @@ async def process_sec_job(job_id: str, company: Dict[str, Any], n_years: int, fo
                     # Publish to message bus if enabled
                     if PUBLISH_ENABLED:
                         try:
-                            publisher.publish(SEC_TOPIC, envelope)
-                            logger.info(f"[SEC] Published {ticker or cik} filing for year {year} to {SEC_TOPIC}")
+                            publisher.publish(settings.message_bus.sec_topic, envelope)
+                            logger.info(f"[SEC] Published {ticker or cik} filing for year {year} to {settings.message_bus.sec_topic}")
                         except Exception as pub_exc:
                             logger.warning(f"[SEC] Failed to publish envelope to message bus: {pub_exc} (org={organization_id}, job={job_id})")
                     
@@ -356,8 +357,8 @@ async def process_yahoo_job(job_id: str, company: Dict[str, Any], organization_i
         # Publish to message bus if enabled
         if PUBLISH_ENABLED:
             try:
-                publisher.publish(YAHOO_TOPIC, envelope)
-                logger.info(f"[Yahoo] Published {ticker} data to {YAHOO_TOPIC}")
+                publisher.publish(settings.message_bus.yahoo_topic, envelope)
+                logger.info(f"[Yahoo] Published {ticker} data to {settings.message_bus.yahoo_topic}")
             except Exception as pub_exc:
                 logger.warning(f"[Yahoo] Failed to publish envelope to message bus: {pub_exc} (org={organization_id}, job={job_id})")
         
@@ -457,7 +458,10 @@ async def process_xbrl_job(job_id: str, company: Dict[str, Any], concepts: List[
                 # Publish to message bus if enabled
                 if PUBLISH_ENABLED:
                     try:
-                        publisher.publish(f"data.xbrl.{concept.replace(':', '_')}", envelope)
+                        # Create XBRL topic using prefix from centralized settings
+                        xbrl_topic = f"{settings.message_bus.xbrl_topic_prefix}.{concept.replace(':', '_')}"
+                        publisher.publish(xbrl_topic, envelope)
+                        logger.info(f"[XBRL] Published {ticker or cik} data for concept {concept} to {xbrl_topic}")
                     except Exception as pub_exc:
                         logger.warning(f"[XBRL] Failed to publish envelope to message bus: {pub_exc}")
                 
@@ -543,12 +547,13 @@ async def main():
     The worker is designed to run indefinitely until explicitly terminated,
     making it suitable for containerized environments and long-running services.
     """
-    # Log worker startup with concurrency settings
-    logger.info(f"Async worker started with concurrency limit {WORKER_CONCURRENCY}")
+    # Log worker startup with concurrency settings from centralized configuration
+    logger.info(f"Async worker started with concurrency limit {settings.worker.concurrency}")
     
-    # Create a semaphore to limit concurrent tasks
+    # Create a semaphore to limit concurrent tasks based on configured concurrency
     # This ensures we don't overwhelm external APIs or exhaust system resources
-    semaphore = asyncio.Semaphore(WORKER_CONCURRENCY)
+    # The concurrency limit is defined in the centralized configuration system
+    semaphore = asyncio.Semaphore(settings.worker.concurrency)
     
     # Validate Redis connection at startup
     # If Redis is unavailable, the worker cannot function and should exit
@@ -563,9 +568,9 @@ async def main():
     # This provides real-time visibility into worker performance
     if PROMETHEUS_ENABLED:
         try:
-            metrics_port = int(os.getenv("METRICS_PORT", "8000"))
-            start_http_server(metrics_port)
-            logger.info(f"Started Prometheus metrics server on port {metrics_port}")
+            # Use metrics port from centralized configuration
+            start_http_server(settings.metrics_port)
+            logger.info(f"Started Prometheus metrics server on port {settings.metrics_port}")
         except Exception as e:
             logger.error(f"Failed to start Prometheus metrics server: {e}")
             # Continue running even if metrics server fails to start
@@ -577,7 +582,7 @@ async def main():
             # Poll for jobs using Redis BLPOP
             # BLPOP is a blocking operation that waits for a job to be available
             # The timeout parameter (5 seconds) allows periodic health checks
-            job_data = redis_client.blpop("data_jobs", timeout=5)
+            job_data = redis_client.blpop(settings.queue_name, timeout=5)
             logger.debug(f"Polled Redis: job_data={job_data}")
             
             # If no job is available within the timeout period, sleep briefly and try again

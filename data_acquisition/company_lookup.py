@@ -28,17 +28,16 @@ from typing import Dict, Any, List, Optional, Union
 from config import settings
 from data_acquisition.utils import timestamp_now, mask_sensitive, JsonLogger
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("company_lookup")
+# Get centralized logging configuration
+from data_acquisition.utils import configure_logging
+
+# Get logger specific to this module
+logger = configure_logging("company_lookup")
 json_logger = JsonLogger("company_lookup")
 
 # Initialize Redis client
 try:
-    redis_client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+    redis_client = redis.Redis.from_url(settings.redis.url, decode_responses=True)
     REDIS_AVAILABLE = True
 except Exception as e:
     logger.warning(f"Redis not available for company lookup caching: {e}")
@@ -68,12 +67,12 @@ class CompanyLookup:
             cache_ttl_seconds: Time-to-live for cached company data in seconds (default: 24 hours)
         """
         self.cache_ttl = cache_ttl_seconds
-        self.sec_api_key = settings.SEC_API_KEY
-        self.sec_api_base_url = settings.SEC_API_BASE_URL
+        self.sec_api_key = settings.api_keys.sec
+        self.sec_api_base_url = settings.service_urls.sec_api_base
         
         # Standard headers for HTTP requests
         self.headers = {
-            "User-Agent": settings.SEC_USER_AGENT,
+            "User-Agent": settings.sec_user_agent,
             "Accept": "application/json",
         }
         
@@ -185,7 +184,7 @@ class CompanyLookup:
         try:
             # Use httpx.AsyncClient for asynchronous requests
             async with httpx.AsyncClient() as client:
-                resp = await client.get(url, headers=self.headers, timeout=settings.SEC_REQUEST_TIMEOUT_SEC)
+                resp = await client.get(url, headers=self.headers, timeout=settings.sec_request_timeout_sec)
                 
                 # Log response details for debugging
                 logger.debug(f"SEC API status code: {resp.status_code}")
@@ -269,7 +268,7 @@ class CompanyLookup:
         
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.get(url, headers=self.headers, timeout=settings.SEC_REQUEST_TIMEOUT_SEC)
+                resp = await client.get(url, headers=self.headers, timeout=settings.sec_request_timeout_sec)
                 
                 if resp.status_code != 200:
                     error_msg = f"SEC API returned status {resp.status_code}: {resp.text}"
@@ -501,7 +500,7 @@ class CompanyLookup:
         
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.get(url, headers=self.headers, timeout=settings.SEC_REQUEST_TIMEOUT_SEC)
+                resp = await client.get(url, headers=self.headers, timeout=settings.sec_request_timeout_sec)
                 
                 if resp.status_code != 200:
                     error_msg = f"SEC API returned status {resp.status_code}: {resp.text}"

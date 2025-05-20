@@ -26,14 +26,49 @@ import logging
 import datetime
 from typing import Dict, Any, Optional
 
-# Configure logging with a standard format
+# Centralized logging configuration
 # This ensures all log entries have consistent timestamps and structure
 # for easier filtering, searching, and analysis
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("utils")
+
+def configure_logging(module_name, level=None):
+    """
+    Configure logging with standard format for a module.
+    
+    This provides consistent logging configuration across all modules,
+    with proper timestamps and formatting. If not specified, the level
+    is taken from the application settings.
+    
+    Args:
+        module_name: Name of the module (used as logger name)
+        level: Optional log level override
+        
+    Returns:
+        Configured logger instance
+    """
+    from config import settings
+    
+    # Only configure root logger once
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        # Set up root logger with our standard format
+        logging.basicConfig(
+            level=getattr(logging, settings.log_level),
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+    
+    # Get a logger for this specific module
+    logger = logging.getLogger(module_name)
+    
+    # Set level from settings if not specified
+    if level is None:
+        logger.setLevel(getattr(logging, settings.log_level))
+    else:
+        logger.setLevel(level)
+        
+    return logger
+
+# Get logger for utils module
+logger = configure_logging("utils")
 
 def get_job_redis_key(organization_id: Optional[str], job_id: str, key_type: str) -> str:
     """
