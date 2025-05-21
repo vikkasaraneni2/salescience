@@ -54,7 +54,7 @@ Data Flow:
 ---------
 1. Client submits a job via POST /submit
 2. API generates job ID and initializes tracking in Redis
-3. API enqueues job details to 'data_jobs' Redis list
+3. API enqueues job details to the configured Redis job queue
 4. Worker nodes pick up jobs from the queue and process them
 5. Workers update job status and store results in Redis
 6. Client polls status endpoint until job is complete
@@ -118,12 +118,12 @@ Deployment Instructions:
 4. Start the worker (see worker.py)
 5. Use the endpoints to submit and track jobs.
 
-Environment Variables:
+Configuration Settings:
 --------------------
-- REDIS_URL: Redis connection string (default: redis://localhost:6379/0)
-- LOG_LEVEL: Logging level (default: INFO)
+- settings.redis.url: Redis connection string
+- settings.log_level: Logging level
+- settings.queue_name: Name of the Redis job queue
 """
-import os
 import uuid
 import logging
 import json
@@ -131,19 +131,24 @@ from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 import redis
-from dotenv import load_dotenv
+from config import settings
 from data_acquisition.json_logger import JsonLogger
 
-# Load environment variables from .env if present
-load_dotenv()
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging using centralized settings
+logging.basicConfig(level=getattr(logging, settings.log_level))
 logger = logging.getLogger("orchestrator_api")
 
-# Redis connection
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+# Redis connection from centralized settings
+REDIS_URL = settings.redis.url
+redis_client = redis.Redis.from_url(
+    REDIS_URL, 
+    decode_responses=True,
+    password=settings.redis.password,
+    ssl=settings.redis.ssl,
+    socket_timeout=settings.redis.socket_timeout,
+    socket_connect_timeout=settings.redis.socket_connect_timeout,
+    retry_on_timeout=settings.redis.retry_on_timeout
+)
 
 # Replace logger with structured JSON logger
 json_logger = JsonLogger("orchestrator_api")
@@ -401,13 +406,13 @@ def enqueue_job(job_id: str, companies: List[CompanyRequest], n_years: int, form
     
     # Debug logging
     logger.info(f"Enqueueing job to Redis: {job_payload}")
-    result = redis_client.rpush("data_jobs", json.dumps(job_payload))
+    result = redis_client.rpush(settings.queue_name, json.dumps(job_payload))
     logger.info(f"Redis rpush result: {result}")
     
     json_logger.log_json(
         level="info",
         action="enqueue_job",
-        message="Enqueued job to data_jobs queue",
+        message=f"Enqueued job to {settings.queue_name} queue",
         organization_id=organization_id,
         job_id=job_id,
         status="queued",

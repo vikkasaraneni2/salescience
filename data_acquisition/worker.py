@@ -66,6 +66,7 @@ import redis
 import datetime
 import time
 import traceback
+import uuid
 from typing import Dict, Any, List, Optional
 
 # Import data source implementations
@@ -77,6 +78,16 @@ from data_acquisition.utils import get_job_redis_key, log_job_status, normalize_
 
 # Import centralized configuration
 from config import settings
+
+# Import error framework
+from data_acquisition.errors import (
+    SalescienceError, ErrorContext, 
+    SECError, SECNotFoundError, SECRateLimitError,
+    YahooError, 
+    RedisError, RedisOperationError, RedisConnectionError,
+    WorkerError, WorkerProcessingError, WorkerTimeoutError,
+    log_error, format_error_response
+)
 
 # Try to import optional modules
 try:
@@ -137,16 +148,29 @@ async def process_sec_job(job_id: str, company: Dict[str, Any], n_years: int, fo
         organization_id: Organization identifier
         user_id: User identifier
     """
+    # Generate a request_id for tracing
+    request_id = str(uuid.uuid4())
+    
+    # Create error context
+    context = ErrorContext(
+        request_id=request_id,
+        organization_id=organization_id,
+        user_id=user_id,
+        company=company,
+        source_type="SEC"
+    )
+    
     start_time = time.time()
     if PROMETHEUS_ENABLED:
         WORKER_CURRENT_JOBS.inc()
         WORKER_JOBS_TOTAL.labels(source='SEC').inc()
 
-    logger.info(f"[SEC] Processing batch job {job_id} for {company} (org={organization_id}, user={user_id})")
+    logger.info(f"[{request_id}][SEC] Processing batch job {job_id} for {company} (org={organization_id}, user={user_id})")
     json_logger.log_json(
         level="info",
         action="sec_job_start",
         job_id=job_id,
+        request_id=request_id,
         company=company,
         n_years=n_years,
         form_type=form_type,
@@ -167,10 +191,11 @@ async def process_sec_job(job_id: str, company: Dict[str, Any], n_years: int, fo
             'form_type': form_type
         }
         
-        # Try to fetch all years at once using fetch_last_n_years
+        # Try to fetch all years at once using fetch_last_n_years with request_id
         try:
-            logger.info(f"[SEC] Fetching {n_years} years of {form_type} for {ticker or cik} (org={organization_id})")
-            results = sec.fetch_last_n_years(params, n_years, form_type)
+            logger.info(f"[{request_id}][SEC] Fetching {n_years} years of {form_type} for {ticker or cik} (org={organization_id})")
+            # Pass request_id to enable proper tracing
+            results = sec.fetch_last_n_years(params, n_years, form_type, request_id)
             
             # Process each result
             for idx, envelope in enumerate(results):
@@ -180,85 +205,136 @@ async def process_sec_job(job_id: str, company: Dict[str, Any], n_years: int, fo
                 # Normalize response
                 envelope = normalize_envelope(envelope)
                 
+                # Add request_id to metadata for tracing
+                if 'metadata' not in envelope:
+                    envelope['metadata'] = {}
+                envelope['metadata']['request_id'] = request_id
+                
                 # Publish to message bus if enabled
                 if PUBLISH_ENABLED:
                     try:
                         publisher.publish(settings.message_bus.sec_topic, envelope)
-                        logger.info(f"[SEC] Published {ticker or cik} filing for year {year} to {settings.message_bus.sec_topic}")
+                        logger.info(f"[{request_id}][SEC] Published {ticker or cik} filing for year {year} to {settings.message_bus.sec_topic}")
                     except Exception as pub_exc:
-                        logger.warning(f"[SEC] Failed to publish envelope to message bus: {pub_exc} (org={organization_id}, job={job_id})")
+                        error = SalescienceError(f"Failed to publish to message bus", context=context, cause=pub_exc)
+                        log_error(error, logger)
                 
                 # Store result and status in Redis using organization-prefixed keys
-                redis_client.hset(get_job_redis_key(organization_id, job_id, "result"), key, json.dumps(envelope))
-                redis_client.hset(get_job_redis_key(organization_id, job_id, "status"), key, envelope.get("status", "error"))
-                
-                logger.info(f"[SEC] Processed filing {idx+1}/{n_years} for {ticker or cik} with status {envelope.get('status')} (org={organization_id})")
-        
-        except Exception as batch_error:
-            logger.error(f"[SEC] Error in batch fetch: {batch_error}, falling back to individual fetches")
-            
-            # Fall back to individual fetches
-            for idx in range(n_years):
-                year = datetime.datetime.now().year - idx
-                key = get_source_key(company, 'SEC', idx)
-                
-                # Update status to processing
-                redis_client.hset(get_job_redis_key(organization_id, job_id, "status"), key, "processing")
-                log_job_status(job_id, "processing", organization_id, {
-                    'company': ticker or cik,
-                    'source': 'SEC',
-                    'year': year,
-                    'year_idx': idx
-                })
-                
                 try:
-                    logger.info(f"[SEC] Fetching {form_type} for {ticker or cik} for year {year} (org={organization_id})")
-                    
-                    # Fetch data for this year
-                    result = sec.fetch({
-                        'ticker': ticker,
-                        'cik': cik,
-                        'form_type': form_type,
-                        'year': year
-                    })
-                    
-                    # Normalize response
-                    envelope = normalize_envelope(result)
-                    
-                    # Publish to message bus if enabled
-                    if PUBLISH_ENABLED:
-                        try:
-                            publisher.publish(settings.message_bus.sec_topic, envelope)
-                            logger.info(f"[SEC] Published {ticker or cik} filing for year {year} to {settings.message_bus.sec_topic}")
-                        except Exception as pub_exc:
-                            logger.warning(f"[SEC] Failed to publish envelope to message bus: {pub_exc} (org={organization_id}, job={job_id})")
-                    
-                    # Store result and status in Redis using organization-prefixed keys
+                    # Store with request_id for tracing
                     redis_client.hset(get_job_redis_key(organization_id, job_id, "result"), key, json.dumps(envelope))
                     redis_client.hset(get_job_redis_key(organization_id, job_id, "status"), key, envelope.get("status", "error"))
                     
-                    logger.info(f"[SEC] Successfully processed {ticker or cik} for year {year} (org={organization_id})")
-                except Exception as e:
-                    logger.error(f"[SEC] Error processing {ticker or cik} for year {year}: {e}")
-                    # Store error in Redis
-                    error_envelope = {
-                        'error': str(e),
-                        'status': 'error',
-                        'source': 'sec',
-                        'content': None,
-                        'content_type': None,
-                        'metadata': {
-                            'ticker': ticker,
-                            'cik': cik,
-                            'year': year,
-                            'form_type': form_type
-                        }
-                    }
-                    redis_client.hset(get_job_redis_key(organization_id, job_id, "result"), key, json.dumps(error_envelope))
-                    redis_client.hset(get_job_redis_key(organization_id, job_id, "status"), key, "error")
+                    # Add request_id to audit log
+                    redis_client.hset(
+                        get_job_redis_key(organization_id, job_id, "audit"), 
+                        f"{key}:{timestamp_now()}", 
+                        json.dumps({
+                            "action": "store_result",
+                            "request_id": request_id,
+                            "status": envelope.get("status", "error")
+                        })
+                    )
                     
-                    if PROMETHEUS_ENABLED:
-                        WORKER_JOB_FAILURES.labels(source='SEC').inc()
+                    # Add TTL for Redis keys
+                    redis_client.expire(get_job_redis_key(organization_id, job_id, "result"), settings.job_expiry_sec)
+                    redis_client.expire(get_job_redis_key(organization_id, job_id, "status"), settings.job_expiry_sec)
+                    redis_client.expire(get_job_redis_key(organization_id, job_id, "audit"), settings.job_expiry_sec)
+                    
+                except Exception as redis_exc:
+                    error = RedisOperationError(
+                        f"Failed to store results in Redis: {redis_exc}", 
+                        context=context.with_context(year=year, idx=idx),
+                        cause=redis_exc
+                    )
+                    log_error(error, logger)
+                    raise error
+                
+                logger.info(f"[{request_id}][SEC] Processed filing {idx+1}/{n_years} for {ticker or cik} with status {envelope.get('status')} (org={organization_id})")
+        
+        except SECError as sec_error:
+            # Log with specific SEC error information
+            log_error(sec_error, logger)
+            # Include error code in log message for easier troubleshooting
+            logger.warning(f"[{request_id}][SEC] SEC error in batch fetch ({sec_error.error_code}), falling back to individual fetches: {sec_error.message}")
+            
+            # Store error in audit log
+            try:
+                redis_client.hset(
+                    get_job_redis_key(organization_id, job_id, "audit"), 
+                    f"batch:{timestamp_now()}", 
+                    json.dumps({
+                        "action": "batch_fetch_error",
+                        "request_id": request_id,
+                        "error_code": sec_error.error_code,
+                        "error": sec_error.message
+                    })
+                )
+            except Exception as e:
+                logger.warning(f"[{request_id}][SEC] Failed to store audit log: {e}")
+            
+            # Fall back to individual fetches
+            await _process_sec_individual_fetches(
+                sec, job_id, company, n_years, form_type, organization_id, 
+                user_id, request_id, context
+            )
+        
+        except SalescienceError as s_error:
+            # Log with structured error information
+            log_error(s_error, logger)
+            logger.warning(f"[{request_id}][SEC] Error in batch fetch ({s_error.error_code}), falling back to individual fetches: {s_error.message}")
+            
+            # Store error in audit log
+            try:
+                redis_client.hset(
+                    get_job_redis_key(organization_id, job_id, "audit"), 
+                    f"batch:{timestamp_now()}", 
+                    json.dumps({
+                        "action": "batch_fetch_error",
+                        "request_id": request_id,
+                        "error_code": s_error.error_code,
+                        "error": s_error.message
+                    })
+                )
+            except Exception as e:
+                logger.warning(f"[{request_id}][SEC] Failed to store audit log: {e}")
+            
+            # Fall back to individual fetches
+            await _process_sec_individual_fetches(
+                sec, job_id, company, n_years, form_type, organization_id, 
+                user_id, request_id, context
+            )
+            
+        except Exception as batch_error:
+            # Wrap unexpected errors in WorkerProcessingError
+            error = WorkerProcessingError(
+                f"Unexpected error in batch fetch: {batch_error}", 
+                context=context,
+                cause=batch_error
+            )
+            log_error(error, logger)
+            logger.warning(f"[{request_id}][SEC] Error in batch fetch, falling back to individual fetches")
+            
+            # Store error in audit log
+            try:
+                redis_client.hset(
+                    get_job_redis_key(organization_id, job_id, "audit"), 
+                    f"batch:{timestamp_now()}", 
+                    json.dumps({
+                        "action": "batch_fetch_error",
+                        "request_id": request_id,
+                        "error_code": "WORKER_PROCESSING_ERROR",
+                        "error": str(batch_error)
+                    })
+                )
+            except Exception as e:
+                logger.warning(f"[{request_id}][SEC] Failed to store audit log: {e}")
+            
+            # Fall back to individual fetches
+            await _process_sec_individual_fetches(
+                sec, job_id, company, n_years, form_type, organization_id, 
+                user_id, request_id, context
+            )
         
         # Update overall status
         all_status = redis_client.hvals(get_job_redis_key(organization_id, job_id, "status"))
@@ -271,28 +347,68 @@ async def process_sec_job(job_id: str, company: Dict[str, Any], n_years: int, fo
         else:
             redis_client.set(get_job_redis_key(organization_id, job_id, "overall_status"), "not_found")
         
-        logger.info(f"[SEC] Completed batch job {job_id} for {company} (org={organization_id}, user={user_id})")
+        logger.info(f"[{request_id}][SEC] Completed batch job {job_id} for {company} (org={organization_id}, user={user_id})")
         json_logger.log_json(
             level="info",
             action="sec_job_complete",
             job_id=job_id,
+            request_id=request_id,
             company=company,
             organization_id=organization_id,
             user_id=user_id,
             duration=time.time() - start_time
         )
     except Exception as e:
-        logger.error(f"[SEC] Error processing batch job {job_id} for {company} (org={organization_id}, user={user_id}): {e}", exc_info=True)
+        # Catch-all handler for job-level errors
+        logger.error(f"[{request_id}][SEC] Error processing batch job {job_id} for {company} (org={organization_id}, user={user_id}): {e}", exc_info=True)
+        
+        # Ensure ticker is defined for error handling
+        ticker = company.get('ticker') or company.get('cik') or company.get('name')
+        
+        # Handle error for all years
         for idx in range(n_years):
-            key = f"{ticker or cik or company.get('name')}:SEC:{idx}"
+            key = f"{ticker}:SEC:{idx}"
             redis_client.hset(get_job_redis_key(organization_id, job_id, "status"), key, "error")
-            redis_client.hset(get_job_redis_key(organization_id, job_id, "result"), key, json.dumps({"error": str(e)}))
+            
+            # Create proper error envelope with request_id
+            error_envelope = {
+                'content': None,
+                'content_type': None,
+                'source': 'sec',
+                'status': 'error',
+                'error': str(e),
+                'metadata': {
+                    'ticker': ticker,
+                    'year': datetime.datetime.now().year - idx,
+                    'form_type': form_type,
+                    'request_id': request_id
+                }
+            }
+            
+            redis_client.hset(get_job_redis_key(organization_id, job_id, "result"), key, json.dumps(error_envelope))
+        
+        # Set overall status
         redis_client.set(get_job_redis_key(organization_id, job_id, "overall_status"), "error")
+        
+        # Store in audit log
+        try:
+            redis_client.hset(
+                get_job_redis_key(organization_id, job_id, "audit"), 
+                f"job:{timestamp_now()}", 
+                json.dumps({
+                    "action": "job_error",
+                    "request_id": request_id,
+                    "error": str(e)
+                })
+            )
+        except Exception as audit_error:
+            logger.warning(f"[{request_id}][SEC] Failed to store audit log: {audit_error}")
         
         json_logger.log_json(
             level="error",
             action="sec_job_error",
             job_id=job_id,
+            request_id=request_id,
             company=company,
             organization_id=organization_id,
             user_id=user_id,
@@ -308,6 +424,156 @@ async def process_sec_job(job_id: str, company: Dict[str, Any], n_years: int, fo
             WORKER_JOB_DURATION.labels(source='SEC').observe(time.time() - start_time)
 
 
+async def _process_sec_individual_fetches(sec, job_id, company, n_years, form_type, organization_id, user_id, request_id, context):
+    """
+    Helper function to process individual year SEC fetches when batch fetch fails.
+    
+    Args:
+        sec: SECDataSource instance
+        job_id: Unique job identifier
+        company: Company information (ticker or CIK)
+        n_years: Number of years of filings to fetch
+        form_type: Type of form to fetch
+        organization_id: Organization identifier
+        user_id: User identifier
+        request_id: Request ID for tracing
+        context: Error context for error handling
+    """
+    ticker = company.get('ticker') or company.get('name')
+    cik = company.get('cik')
+    
+    for idx in range(n_years):
+        year = datetime.datetime.now().year - idx
+        key = get_source_key(company, 'SEC', idx)
+        
+        # Update status to processing
+        redis_client.hset(get_job_redis_key(organization_id, job_id, "status"), key, "processing")
+        log_job_status(job_id, "processing", organization_id, {
+            'company': ticker or cik,
+            'source': 'SEC',
+            'year': year,
+            'year_idx': idx,
+            'request_id': request_id
+        })
+        
+        # Store processing status in audit log
+        try:
+            redis_client.hset(
+                get_job_redis_key(organization_id, job_id, "audit"), 
+                f"{key}:{timestamp_now()}", 
+                json.dumps({
+                    "action": "processing_year",
+                    "request_id": request_id,
+                    "year": year
+                })
+            )
+        except Exception as e:
+            logger.warning(f"[{request_id}][SEC] Failed to store audit log: {e}")
+        
+        try:
+            # Generate a unique sub-request ID for this year's fetch for detailed tracing
+            year_request_id = f"{request_id}-{year}"
+            logger.info(f"[{year_request_id}][SEC] Fetching {form_type} for {ticker or cik} for year {year} (org={organization_id})")
+            
+            # Fetch data for this year with request ID for tracing
+            result = sec.fetch({
+                'ticker': ticker,
+                'cik': cik,
+                'form_type': form_type,
+                'year': year
+            }, year_request_id)
+            
+            # Normalize response
+            envelope = normalize_envelope(result)
+            
+            # Add request_id to metadata for tracing
+            if 'metadata' not in envelope:
+                envelope['metadata'] = {}
+            envelope['metadata']['request_id'] = year_request_id
+            
+            # Publish to message bus if enabled
+            if PUBLISH_ENABLED:
+                try:
+                    publisher.publish(settings.message_bus.sec_topic, envelope)
+                    logger.info(f"[{year_request_id}][SEC] Published {ticker or cik} filing for year {year} to {settings.message_bus.sec_topic}")
+                except Exception as pub_exc:
+                    # Create specific error with context
+                    error = SalescienceError(
+                        f"Failed to publish filing to message bus", 
+                        context=context.with_context(year=year), 
+                        cause=pub_exc
+                    )
+                    log_error(error, logger)
+            
+            # Store result and status in Redis using organization-prefixed keys
+            redis_client.hset(get_job_redis_key(organization_id, job_id, "result"), key, json.dumps(envelope))
+            redis_client.hset(get_job_redis_key(organization_id, job_id, "status"), key, envelope.get("status", "error"))
+            
+            # Add to audit log
+            try:
+                redis_client.hset(
+                    get_job_redis_key(organization_id, job_id, "audit"), 
+                    f"{key}:{timestamp_now()}", 
+                    json.dumps({
+                        "action": "fetch_complete",
+                        "request_id": year_request_id,
+                        "status": envelope.get("status", "error"),
+                        "year": year
+                    })
+                )
+            except Exception as e:
+                logger.warning(f"[{year_request_id}][SEC] Failed to store audit log: {e}")
+            
+            logger.info(f"[{year_request_id}][SEC] Successfully processed {ticker or cik} for year {year} (org={organization_id})")
+            
+        except Exception as e:
+            # Create specific error with context for logging
+            year_error = WorkerProcessingError(
+                f"Error processing SEC filing for {ticker or cik} for year {year}: {e}",
+                context=context.with_context(year=year),
+                cause=e
+            )
+            log_error(year_error, logger)
+            
+            # Store error in Redis - create proper error envelope
+            error_envelope = {
+                'content': None,
+                'content_type': None,
+                'source': 'sec',
+                'status': 'error',
+                'error': str(e),
+                'metadata': {
+                    'ticker': ticker,
+                    'cik': cik,
+                    'year': year,
+                    'form_type': form_type,
+                    'request_id': request_id
+                }
+            }
+            
+            # Store error result and status
+            redis_client.hset(get_job_redis_key(organization_id, job_id, "result"), key, json.dumps(error_envelope))
+            redis_client.hset(get_job_redis_key(organization_id, job_id, "status"), key, "error")
+            
+            # Add to audit log
+            try:
+                redis_client.hset(
+                    get_job_redis_key(organization_id, job_id, "audit"), 
+                    f"{key}:{timestamp_now()}", 
+                    json.dumps({
+                        "action": "fetch_error",
+                        "request_id": request_id,
+                        "error": str(e),
+                        "year": year
+                    })
+                )
+            except Exception as audit_error:
+                logger.warning(f"[{request_id}][SEC] Failed to store audit log: {audit_error}")
+            
+            if PROMETHEUS_ENABLED:
+                WORKER_JOB_FAILURES.labels(source='SEC').inc()
+
+
 async def process_yahoo_job(job_id: str, company: Dict[str, Any], organization_id: str, user_id: str = None):
     """
     Process a Yahoo Finance data acquisition job for a single company.
@@ -318,16 +584,29 @@ async def process_yahoo_job(job_id: str, company: Dict[str, Any], organization_i
         organization_id: Organization identifier
         user_id: User identifier
     """
+    # Generate a request_id for tracing
+    request_id = str(uuid.uuid4())
+    
+    # Create error context
+    context = ErrorContext(
+        request_id=request_id,
+        organization_id=organization_id,
+        user_id=user_id,
+        company=company,
+        source_type="Yahoo"
+    )
+    
     start_time = time.time()
     if PROMETHEUS_ENABLED:
         WORKER_CURRENT_JOBS.inc()
         WORKER_JOBS_TOTAL.labels(source='Yahoo').inc()
     
-    logger.info(f"[Yahoo] Processing job {job_id} for {company} (org={organization_id}, user={user_id})")
+    logger.info(f"[{request_id}][Yahoo] Processing job {job_id} for {company} (org={organization_id}, user={user_id})")
     json_logger.log_json(
         level="info",
         action="yahoo_job_start",
         job_id=job_id,
+        request_id=request_id,
         company=company,
         organization_id=organization_id,
         user_id=user_id
@@ -343,28 +622,154 @@ async def process_yahoo_job(job_id: str, company: Dict[str, Any], organization_i
         
         # Update status to processing
         redis_client.hset(get_job_redis_key(organization_id, job_id, "status"), key, "processing")
+        
+        # Store processing status in audit log
+        try:
+            redis_client.hset(
+                get_job_redis_key(organization_id, job_id, "audit"), 
+                f"{key}:{timestamp_now()}", 
+                json.dumps({
+                    "action": "processing",
+                    "request_id": request_id
+                })
+            )
+        except Exception as e:
+            logger.warning(f"[{request_id}][Yahoo] Failed to store audit log: {e}")
+        
         log_job_status(job_id, "processing", organization_id, {
             'company': ticker,
-            'source': 'Yahoo'
+            'source': 'Yahoo',
+            'request_id': request_id
         })
         
-        # Fetch data
-        result = yahoo.fetch({'ticker': ticker})
-        
-        # Normalize response
-        envelope = normalize_envelope(result)
-        
-        # Publish to message bus if enabled
-        if PUBLISH_ENABLED:
+        # Fetch data with request_id for tracing
+        try:
+            logger.info(f"[{request_id}][Yahoo] Fetching data for ticker {ticker}")
+            result = yahoo.fetch({'ticker': ticker}, request_id)
+            
+            # Normalize response
+            envelope = normalize_envelope(result)
+            
+            # Add request_id to metadata for tracing
+            if 'metadata' not in envelope:
+                envelope['metadata'] = {}
+            envelope['metadata']['request_id'] = request_id
+            
+            # Publish to message bus if enabled
+            if PUBLISH_ENABLED:
+                try:
+                    publisher.publish(settings.message_bus.yahoo_topic, envelope)
+                    logger.info(f"[{request_id}][Yahoo] Published {ticker} data to {settings.message_bus.yahoo_topic}")
+                except Exception as pub_exc:
+                    # Create specific error with context
+                    error = SalescienceError(
+                        f"Failed to publish Yahoo data to message bus", 
+                        context=context, 
+                        cause=pub_exc
+                    )
+                    log_error(error, logger)
+            
+            # Store result and status in Redis using organization-prefixed keys
+            redis_client.hset(get_job_redis_key(organization_id, job_id, "result"), key, json.dumps(envelope))
+            redis_client.hset(get_job_redis_key(organization_id, job_id, "status"), key, envelope.get("status", "error"))
+            
+            # Add to audit log
             try:
-                publisher.publish(settings.message_bus.yahoo_topic, envelope)
-                logger.info(f"[Yahoo] Published {ticker} data to {settings.message_bus.yahoo_topic}")
-            except Exception as pub_exc:
-                logger.warning(f"[Yahoo] Failed to publish envelope to message bus: {pub_exc} (org={organization_id}, job={job_id})")
-        
-        # Store result and status in Redis using organization-prefixed keys
-        redis_client.hset(get_job_redis_key(organization_id, job_id, "result"), key, json.dumps(envelope))
-        redis_client.hset(get_job_redis_key(organization_id, job_id, "status"), key, envelope.get("status", "error"))
+                redis_client.hset(
+                    get_job_redis_key(organization_id, job_id, "audit"), 
+                    f"{key}:{timestamp_now()}", 
+                    json.dumps({
+                        "action": "fetch_complete",
+                        "request_id": request_id,
+                        "status": envelope.get("status", "error")
+                    })
+                )
+            except Exception as e:
+                logger.warning(f"[{request_id}][Yahoo] Failed to store audit log: {e}")
+            
+        except (YahooError, SalescienceError) as yahoo_error:
+            # Handle specific Yahoo errors with proper context
+            log_error(yahoo_error, logger)
+            logger.error(f"[{request_id}][Yahoo] Specific error fetching data for ticker {ticker}: {yahoo_error.error_code}")
+            
+            # Create error envelope
+            error_envelope = {
+                'content': None,
+                'content_type': None,
+                'source': 'yahoo',
+                'status': 'error',
+                'error': str(yahoo_error),
+                'error_code': yahoo_error.error_code,
+                'metadata': {
+                    'ticker': ticker,
+                    'request_id': request_id
+                }
+            }
+            
+            # Store the error result
+            redis_client.hset(get_job_redis_key(organization_id, job_id, "result"), key, json.dumps(error_envelope))
+            redis_client.hset(get_job_redis_key(organization_id, job_id, "status"), key, "error")
+            
+            # Add to audit log
+            try:
+                redis_client.hset(
+                    get_job_redis_key(organization_id, job_id, "audit"), 
+                    f"{key}:{timestamp_now()}", 
+                    json.dumps({
+                        "action": "fetch_error",
+                        "request_id": request_id,
+                        "error_code": yahoo_error.error_code,
+                        "error": str(yahoo_error)
+                    })
+                )
+            except Exception as e:
+                logger.warning(f"[{request_id}][Yahoo] Failed to store audit log: {e}")
+                
+            if PROMETHEUS_ENABLED:
+                WORKER_JOB_FAILURES.labels(source='Yahoo').inc()
+                
+        except Exception as e:
+            # Handle unexpected errors
+            error = WorkerProcessingError(
+                f"Unexpected error fetching Yahoo data for ticker {ticker}: {e}",
+                context=context,
+                cause=e
+            )
+            log_error(error, logger)
+            
+            # Create error envelope
+            error_envelope = {
+                'content': None,
+                'content_type': None,
+                'source': 'yahoo',
+                'status': 'error',
+                'error': str(e),
+                'metadata': {
+                    'ticker': ticker,
+                    'request_id': request_id
+                }
+            }
+            
+            # Store the error result
+            redis_client.hset(get_job_redis_key(organization_id, job_id, "result"), key, json.dumps(error_envelope))
+            redis_client.hset(get_job_redis_key(organization_id, job_id, "status"), key, "error")
+            
+            # Add to audit log
+            try:
+                redis_client.hset(
+                    get_job_redis_key(organization_id, job_id, "audit"), 
+                    f"{key}:{timestamp_now()}", 
+                    json.dumps({
+                        "action": "fetch_error",
+                        "request_id": request_id,
+                        "error": str(e)
+                    })
+                )
+            except Exception as audit_error:
+                logger.warning(f"[{request_id}][Yahoo] Failed to store audit log: {audit_error}")
+                
+            if PROMETHEUS_ENABLED:
+                WORKER_JOB_FAILURES.labels(source='Yahoo').inc()
         
         # Update overall status
         all_status = redis_client.hvals(get_job_redis_key(organization_id, job_id, "status"))
@@ -377,27 +782,67 @@ async def process_yahoo_job(job_id: str, company: Dict[str, Any], organization_i
         else:
             redis_client.set(get_job_redis_key(organization_id, job_id, "overall_status"), "not_found")
         
-        logger.info(f"[Yahoo] Completed job {job_id} for {ticker} (org={organization_id}, user={user_id})")
+        # Add TTL for Redis keys
+        redis_client.expire(get_job_redis_key(organization_id, job_id, "result"), settings.job_expiry_sec)
+        redis_client.expire(get_job_redis_key(organization_id, job_id, "status"), settings.job_expiry_sec)
+        redis_client.expire(get_job_redis_key(organization_id, job_id, "audit"), settings.job_expiry_sec)
+        
+        logger.info(f"[{request_id}][Yahoo] Completed job {job_id} for {ticker} (org={organization_id}, user={user_id})")
         json_logger.log_json(
             level="info",
             action="yahoo_job_complete",
             job_id=job_id,
+            request_id=request_id,
             company=company,
             organization_id=organization_id,
             user_id=user_id,
             duration=time.time() - start_time
         )
     except Exception as e:
-        logger.error(f"[Yahoo] Error processing job {job_id} for {company} (org={organization_id}, user={user_id}): {e}")
-        key = f"{ticker or company.get('name')}:Yahoo"
+        # Catch-all for any unexpected errors at the job level
+        logger.error(f"[{request_id}][Yahoo] Error processing job {job_id} for {company} (org={organization_id}, user={user_id}): {e}", exc_info=True)
+        
+        # Ensure ticker is defined for error handling
+        ticker = company.get('ticker') or company.get('name')
+        key = f"{ticker}:Yahoo"
+        
+        # Create error envelope with request_id
+        error_envelope = {
+            'content': None,
+            'content_type': None,
+            'source': 'yahoo',
+            'status': 'error',
+            'error': str(e),
+            'metadata': {
+                'ticker': ticker,
+                'request_id': request_id
+            }
+        }
+        
+        # Store error result and status
+        redis_client.hset(get_job_redis_key(organization_id, job_id, "result"), key, json.dumps(error_envelope))
         redis_client.hset(get_job_redis_key(organization_id, job_id, "status"), key, "error")
-        redis_client.hset(get_job_redis_key(organization_id, job_id, "result"), key, json.dumps({"error": str(e)}))
         redis_client.set(get_job_redis_key(organization_id, job_id, "overall_status"), "error")
+        
+        # Add to audit log
+        try:
+            redis_client.hset(
+                get_job_redis_key(organization_id, job_id, "audit"), 
+                f"job:{timestamp_now()}", 
+                json.dumps({
+                    "action": "job_error",
+                    "request_id": request_id,
+                    "error": str(e)
+                })
+            )
+        except Exception as audit_error:
+            logger.warning(f"[{request_id}][Yahoo] Failed to store audit log: {audit_error}")
         
         json_logger.log_json(
             level="error",
             action="yahoo_job_error",
             job_id=job_id,
+            request_id=request_id,
             company=company,
             organization_id=organization_id,
             user_id=user_id,

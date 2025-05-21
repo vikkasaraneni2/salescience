@@ -23,7 +23,9 @@ import logging
 import datetime
 import asyncio
 import time
-from typing import Dict, Any, List, Optional
+import random
+import uuid
+from typing import Dict, Any, List, Optional, Tuple
 
 # Import from internal modules
 from config import settings
@@ -32,6 +34,15 @@ from data_acquisition.utils import normalize_envelope, timestamp_now
 
 # Get centralized logging configuration
 from data_acquisition.utils import configure_logging
+
+# Import error handling framework
+from data_acquisition.errors import (
+    SalescienceError, ErrorContext,
+    YahooError, YahooAuthenticationError, YahooRateLimitError, YahooNotFoundError, YahooParsingError, 
+    MissingConfigurationError, DataSourceConnectionError, DataSourceTimeoutError,
+    ValidationError, DataSourceNotFoundError,
+    log_error, format_error_response
+)
 
 # Get logger specific to this module
 logger = configure_logging("yahoo")
@@ -70,7 +81,7 @@ class YahooDataSource(BaseDataSource):
         
         # Standard headers for all requests
         self.headers = {
-            "User-Agent": settings.SEC_USER_AGENT,
+            "User-Agent": settings.sec_user_agent,
             "Accept": "application/json",
         }
         
@@ -79,7 +90,7 @@ class YahooDataSource(BaseDataSource):
             
         logger.info("Yahoo Finance data source initialized")
     
-    def fetch(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    def fetch(self, params: Dict[str, Any], request_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Fetch Yahoo Finance data for a company.
         
@@ -91,6 +102,7 @@ class YahooDataSource(BaseDataSource):
             params: Dictionary with parameters:
                 - ticker: The stock ticker symbol (required)
                 - modules: List of data modules to fetch (default: summaryProfile,price,defaultKeyStatistics)
+            request_id: Optional request ID for tracing and logging
                 
         Returns:
             Dictionary containing:
@@ -100,76 +112,92 @@ class YahooDataSource(BaseDataSource):
                 - metadata: Additional information about the request
                 
         Raises:
-            ValueError: If required parameters are missing or API errors occur
+            ValidationError: If required parameters are missing
+            YahooAuthenticationError: If authentication fails
+            YahooRateLimitError: If rate limit is exceeded
+            YahooNotFoundError: If ticker can't be found
+            YahooError: For other Yahoo API errors
+            DataSourceConnectionError: For network/connection issues
+            DataSourceTimeoutError: If the request times out
         """
-        # Extract parameters
+        # Generate request_id if not provided for tracing purposes
+        if not request_id:
+            request_id = str(uuid.uuid4())
+            
+        # Create error context with available information
         ticker = params.get('ticker')
         modules = params.get('modules', 'summaryProfile,price,defaultKeyStatistics')
+        
+        context = ErrorContext(
+            request_id=request_id,
+            company={"ticker": ticker},
+            source_type="Yahoo",
+            modules=modules
+        )
         
         # Validate parameters
         if not ticker:
             error_msg = "Parameter 'ticker' is required for YahooDataSource.fetch"
-            logger.error(error_msg)
-            raise ValueError(error_msg)
+            logger.error(f"[{request_id}] {error_msg}")
+            raise ValidationError(error_msg, context=context)
             
-        logger.info(f"Fetching Yahoo Finance data for ticker: {ticker}")
+        logger.info(f"[{request_id}] Fetching Yahoo Finance data for ticker: {ticker}")
         
         try:
-            # First try the direct API approach
-            return self._fetch_via_api(ticker, modules)
-        except Exception as api_error:
-            # Log the API error
-            logger.warning(f"Error fetching data via direct API: {api_error}")
+            # First try the direct API approach with retry logic
+            return self._fetch_via_api(ticker, modules, request_id)
+        except (YahooError, DataSourceConnectionError, DataSourceTimeoutError) as api_error:
+            # Specific known error that might be retried
+            logger.warning(f"[{request_id}] Error fetching data via direct API: {api_error.error_code}: {api_error.message}")
             
-            # Fall back to yfinance if available
-            if YFINANCE_AVAILABLE:
-                logger.info(f"Falling back to yfinance for ticker: {ticker}")
+            # Fall back to yfinance if available for non-authentication errors
+            if YFINANCE_AVAILABLE and not isinstance(api_error, YahooAuthenticationError):
+                logger.info(f"[{request_id}] Falling back to yfinance for ticker: {ticker}")
                 try:
-                    return self._fetch_via_yfinance(ticker)
+                    return self._fetch_via_yfinance(ticker, request_id)
                 except Exception as yf_error:
-                    # Both approaches failed, return error
-                    logger.error(f"Error fetching data via yfinance: {yf_error}")
-                    return {
-                        'content': None,
-                        'content_type': 'json',
-                        'source': 'yahoo',
-                        'status': 'error',
-                        'error': f"API error: {api_error}; yfinance error: {yf_error}",
-                        'metadata': {
-                            'ticker': ticker,
-                            'modules': modules,
-                            'retrieved_at': timestamp_now()
-                        }
-                    }
+                    # Both approaches failed, wrap yfinance error and raise
+                    error_msg = f"Both direct API and yfinance failed for ticker {ticker}"
+                    logger.error(f"[{request_id}] {error_msg}: API error: {api_error}, yfinance error: {yf_error}")
+                    raise YahooError(error_msg, context=context, cause=yf_error)
             else:
-                # Only API approach was attempted, return that error
-                return {
-                    'content': None,
-                    'content_type': 'json',
-                    'source': 'yahoo',
-                    'status': 'error',
-                    'error': f"API error: {api_error}; yfinance not available",
-                    'metadata': {
-                        'ticker': ticker,
-                        'modules': modules,
-                        'retrieved_at': timestamp_now()
-                    }
-                }
+                # Just re-raise the original API error
+                raise
+        except Exception as e:
+            # Unexpected errors
+            error_msg = f"Unexpected error fetching Yahoo Finance data for ticker {ticker}"
+            logger.error(f"[{request_id}] {error_msg}: {e}")
+            raise YahooError(error_msg, context=context, cause=e)
     
-    def _fetch_via_api(self, ticker: str, modules: str) -> Dict[str, Any]:
+    def _fetch_via_api(self, ticker: str, modules: str, request_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Fetch Yahoo Finance data using the direct API.
         
         Args:
             ticker: Stock ticker symbol
             modules: Comma-separated list of data modules to fetch
+            request_id: Optional request ID for tracing and logging
             
         Returns:
             Data envelope with Yahoo Finance data
             
         Raises:
-            ValueError: If API error occurs
+            YahooAuthenticationError: If authentication fails
+            YahooRateLimitError: If rate limit is exceeded
+            YahooNotFoundError: If ticker can't be found
+            YahooParsingError: If response parsing fails
+            YahooError: For other Yahoo API errors
+            DataSourceConnectionError: For network/connection issues
+            DataSourceTimeoutError: If the request times out
         """
+        # Create error context
+        context = ErrorContext(
+            request_id=request_id,
+            company={"ticker": ticker},
+            source_type="Yahoo",
+            modules=modules
+        )
+        
         # Construct the Yahoo Finance API URL
         url = f"{self.base_url}/quoteSummary/{ticker}"
         
@@ -178,69 +206,136 @@ class YahooDataSource(BaseDataSource):
             "modules": modules
         }
         
-        logger.debug(f"Yahoo Finance API request URL: {url}")
-        logger.debug(f"Query parameters: {query_params}")
+        logger.debug(f"[{request_id}] Yahoo Finance API request URL: {url}")
+        logger.debug(f"[{request_id}] Query parameters: {query_params}")
         
-        # Make the request
-        resp = httpx.get(
-            url, 
-            params=query_params,
-            headers=self.headers,
-            timeout=REQUEST_TIMEOUT
-        )
+        # Implement retry with exponential backoff
+        max_retries = settings.worker.max_retries
+        base_delay = settings.worker.retry_delay_sec
+        attempt = 0
         
-        logger.debug(f"Yahoo Finance API status code: {resp.status_code}")
-        
-        if resp.status_code != 200:
-            error_msg = f"Yahoo Finance API returned status {resp.status_code}: {resp.text}"
-            logger.error(error_msg)
-            raise ValueError(f"Yahoo Finance API error: {resp.status_code}")
-            
-        # Parse the response
-        data = resp.json()
-        
-        # Check if the response contains an error
-        if "quoteSummary" not in data or data.get("quoteSummary", {}).get("error"):
-            error = data.get("quoteSummary", {}).get("error", "Unknown error")
-            error_msg = f"Yahoo Finance API returned an error: {error}"
-            logger.error(error_msg)
-            raise ValueError(error_msg)
-            
-        # Extract the quote summary result
-        result = data.get("quoteSummary", {}).get("result", [])
-        
-        if not result:
-            error_msg = f"No data found for ticker '{ticker}'"
-            logger.warning(error_msg)
-            return {
-                'content': None,
-                'content_type': 'json',
-                'source': 'yahoo',
-                'status': 'not_found',
-                'error': error_msg,
-                'metadata': {
-                    'ticker': ticker,
-                    'modules': modules,
-                    'retrieved_at': timestamp_now()
+        while attempt < max_retries:
+            try:
+                logger.info(f"[{request_id}] Fetching data for ticker '{ticker}' via Yahoo API (attempt {attempt+1}/{max_retries})")
+                
+                # Make the request with timeout
+                resp = httpx.get(
+                    url, 
+                    params=query_params,
+                    headers=self.headers,
+                    timeout=REQUEST_TIMEOUT
+                )
+                
+                logger.debug(f"[{request_id}] Yahoo Finance API status code: {resp.status_code}")
+                
+                # Handle different response status codes with specific errors
+                if resp.status_code == 401 or resp.status_code == 403:
+                    error_msg = f"Yahoo Finance API authentication failed: {resp.text}"
+                    logger.error(f"[{request_id}] {error_msg}")
+                    raise YahooAuthenticationError(error_msg, context=context)
+                    
+                elif resp.status_code == 429:
+                    error_msg = f"Yahoo Finance API rate limit exceeded: {resp.text}"
+                    logger.error(f"[{request_id}] {error_msg}")
+                    raise YahooRateLimitError(error_msg, context=context)
+                    
+                elif resp.status_code != 200:
+                    error_msg = f"Yahoo Finance API returned status {resp.status_code}: {resp.text}"
+                    logger.error(f"[{request_id}] {error_msg}")
+                    raise YahooError(error_msg, context=context)
+                
+                # Parse the response
+                try:
+                    data = resp.json()
+                    logger.debug(f"[{request_id}] Yahoo API response: {data}")
+                except json.JSONDecodeError as e:
+                    error_msg = f"Failed to parse Yahoo Finance API response: {e}"
+                    logger.error(f"[{request_id}] {error_msg}")
+                    raise YahooParsingError(error_msg, context=context, cause=e)
+                
+                # Check if the response contains an error
+                if "quoteSummary" not in data or data.get("quoteSummary", {}).get("error"):
+                    error = data.get("quoteSummary", {}).get("error", "Unknown error")
+                    error_msg = f"Yahoo Finance API returned an error: {error}"
+                    logger.error(f"[{request_id}] {error_msg}")
+                    raise YahooError(error_msg, context=context)
+                    
+                # Extract the quote summary result
+                result = data.get("quoteSummary", {}).get("result", [])
+                
+                if not result:
+                    error_msg = f"No data found for ticker '{ticker}'"
+                    logger.warning(f"[{request_id}] {error_msg}")
+                    raise YahooNotFoundError(error_msg, context=context)
+                    
+                # Extract and format the relevant data
+                company_data = result[0]
+                
+                # Successful response, return the data envelope
+                logger.info(f"[{request_id}] Successfully fetched Yahoo Finance data for ticker: {ticker}")
+                return {
+                    'content': company_data,
+                    'content_type': 'json',
+                    'source': 'yahoo',
+                    'status': 'success',
+                    'metadata': {
+                        'ticker': ticker,
+                        'modules': modules,
+                        'retrieved_at': timestamp_now()
+                    }
                 }
-            }
-            
-        # Extract and format the relevant data
-        company_data = result[0]
-        
-        return {
-            'content': company_data,
-            'content_type': 'json',
-            'source': 'yahoo',
-            'status': 'success',
-            'metadata': {
-                'ticker': ticker,
-                'modules': modules,
-                'retrieved_at': timestamp_now()
-            }
-        }
+                
+            except httpx.TimeoutException as e:
+                attempt += 1
+                error_msg = f"Yahoo API request timed out: {e}"
+                logger.warning(f"[{request_id}] {error_msg}. Attempt {attempt}/{max_retries}")
+                
+                if attempt >= max_retries:
+                    raise DataSourceTimeoutError(error_msg, context=context, cause=e)
+                    
+                # Exponential backoff with jitter
+                jitter = 0.1 * base_delay * (random.random() * 2 - 1)
+                delay = min(base_delay * (2 ** (attempt - 1)) + jitter, 30.0)
+                logger.info(f"[{request_id}] Retrying in {delay:.2f}s")
+                time.sleep(delay)
+                
+            except httpx.RequestError as e:
+                attempt += 1
+                error_msg = f"Yahoo API connection error: {e}"
+                logger.warning(f"[{request_id}] {error_msg}. Attempt {attempt}/{max_retries}")
+                
+                if attempt >= max_retries:
+                    raise DataSourceConnectionError(error_msg, context=context, cause=e)
+                    
+                # Exponential backoff with jitter
+                jitter = 0.1 * base_delay * (random.random() * 2 - 1)
+                delay = min(base_delay * (2 ** (attempt - 1)) + jitter, 30.0)
+                logger.info(f"[{request_id}] Retrying in {delay:.2f}s")
+                time.sleep(delay)
+                
+            except (YahooAuthenticationError, YahooNotFoundError) as e:
+                # Don't retry authentication errors or not found errors
+                raise
+                
+            except (YahooError, SalescienceError) as e:
+                # For other Yahoo-specific errors, attempt retry if not at max
+                attempt += 1
+                if attempt >= max_retries:
+                    raise
+                    
+                # Exponential backoff with jitter
+                jitter = 0.1 * base_delay * (random.random() * 2 - 1)
+                delay = min(base_delay * (2 ** (attempt - 1)) + jitter, 30.0)
+                logger.info(f"[{request_id}] Retrying in {delay:.2f}s after error: {e.error_code}")
+                time.sleep(delay)
+                
+            except Exception as e:
+                # For unexpected errors, wrap in YahooError and raise
+                error_msg = f"Unexpected error fetching Yahoo Finance data for ticker '{ticker}': {e}"
+                logger.error(f"[{request_id}] {error_msg}")
+                raise YahooError(error_msg, context=context, cause=e)
     
-    def _fetch_via_yfinance(self, ticker: str) -> Dict[str, Any]:
+    def _fetch_via_yfinance(self, ticker: str, request_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Fetch Yahoo Finance data using the yfinance package.
         
@@ -248,37 +343,66 @@ class YahooDataSource(BaseDataSource):
         
         Args:
             ticker: Stock ticker symbol
+            request_id: Optional request ID for tracing and logging
             
         Returns:
             Data envelope with Yahoo Finance data
             
         Raises:
-            ValueError: If yfinance error occurs
+            MissingConfigurationError: If yfinance package is not installed
+            YahooNotFoundError: If ticker can't be found
+            YahooError: For other yfinance errors
         """
-        if not YFINANCE_AVAILABLE:
-            raise ValueError("yfinance package is not installed")
-            
-        # Use yfinance to fetch data
-        yf_ticker = yf.Ticker(ticker)
-        info = yf_ticker.info
+        # Create error context
+        context = ErrorContext(
+            request_id=request_id,
+            company={"ticker": ticker},
+            source_type="Yahoo-yfinance"
+        )
         
-        # yfinance returns an empty dict for invalid tickers
-        if not info or 'regularMarketPrice' not in info:
-            raise ValueError(f"Ticker '{ticker}' not found or not valid on Yahoo Finance")
+        if not YFINANCE_AVAILABLE:
+            error_msg = "yfinance package is not installed"
+            logger.error(f"[{request_id}] {error_msg}")
+            raise MissingConfigurationError(error_msg, context=context)
             
-        return {
-            'content': info,  # This is a dict with all available company/stock info
-            'content_type': 'json',
-            'source': 'yahoo',
-            'status': 'success',
-            'metadata': {
-                'ticker': ticker,
-                'source_package': 'yfinance',
-                'retrieved_at': timestamp_now()
+        logger.info(f"[{request_id}] Fetching data for ticker '{ticker}' via yfinance")
+        
+        try:
+            # Use yfinance to fetch data
+            yf_ticker = yf.Ticker(ticker)
+            info = yf_ticker.info
+            
+            # yfinance returns an empty dict for invalid tickers
+            if not info or len(info) < 5 or 'regularMarketPrice' not in info:
+                error_msg = f"Ticker '{ticker}' not found or not valid on Yahoo Finance (yfinance)"
+                logger.warning(f"[{request_id}] {error_msg}")
+                raise YahooNotFoundError(error_msg, context=context)
+                
+            logger.info(f"[{request_id}] Successfully fetched data for ticker '{ticker}' via yfinance")
+            return {
+                'content': info,  # This is a dict with all available company/stock info
+                'content_type': 'json',
+                'source': 'yahoo',
+                'status': 'success',
+                'metadata': {
+                    'ticker': ticker,
+                    'source_package': 'yfinance',
+                    'retrieved_at': timestamp_now()
+                }
             }
-        }
+        except YahooNotFoundError:
+            # Re-raise specific exceptions
+            raise
+        except SalescienceError:
+            # Re-raise other SalescienceErrors 
+            raise
+        except Exception as e:
+            # Wrap other exceptions in YahooError
+            error_msg = f"Error fetching data for ticker '{ticker}' via yfinance"
+            logger.error(f"[{request_id}] {error_msg}: {e}")
+            raise YahooError(error_msg, context=context, cause=e)
     
-    async def fetch_historical_prices(self, ticker: str, period: str = "1y", interval: str = "1d") -> Dict[str, Any]:
+    async def fetch_historical_prices(self, ticker: str, period: str = "1y", interval: str = "1d", request_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Fetch historical stock prices for a company.
         
@@ -289,64 +413,68 @@ class YahooDataSource(BaseDataSource):
             ticker: Stock ticker symbol
             period: Time period for historical data (1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, max)
             interval: Data interval (1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo)
+            request_id: Optional request ID for tracing and logging
             
         Returns:
             Dictionary containing historical price data and metadata
             
         Raises:
-            ValueError: If API error occurs
+            ValidationError: If required parameters are missing
+            YahooAuthenticationError: If authentication fails
+            YahooRateLimitError: If rate limit is exceeded
+            YahooNotFoundError: If ticker can't be found
+            YahooError: For other Yahoo API errors
+            DataSourceConnectionError: For network/connection issues
+            DataSourceTimeoutError: If the request times out
         """
+        # Generate request_id if not provided for tracing purposes
+        if not request_id:
+            request_id = str(uuid.uuid4())
+            
+        # Create error context
+        context = ErrorContext(
+            request_id=request_id,
+            company={"ticker": ticker},
+            source_type="Yahoo-historical",
+            period=period,
+            interval=interval
+        )
+        
         if not ticker:
             error_msg = "Ticker symbol is required for historical prices"
-            logger.error(error_msg)
-            raise ValueError(error_msg)
+            logger.error(f"[{request_id}] {error_msg}")
+            raise ValidationError(error_msg, context=context)
             
-        logger.info(f"Fetching historical prices for {ticker} ({period}, {interval})")
+        logger.info(f"[{request_id}] Fetching historical prices for {ticker} ({period}, {interval})")
         
         try:
-            # Try API approach first
-            historical_data = await self._fetch_historical_via_api(ticker, period, interval)
+            # Try API approach first with enhanced error handling
+            historical_data = await self._fetch_historical_via_api(ticker, period, interval, request_id)
             return historical_data
-        except Exception as api_error:
-            logger.warning(f"Error fetching historical data via API: {api_error}")
+        except (YahooError, DataSourceConnectionError, DataSourceTimeoutError) as api_error:
+            # Log the specific error
+            logger.warning(f"[{request_id}] Error fetching historical data via API: {api_error.error_code}: {api_error.message}")
             
-            # Fall back to yfinance if available
-            if YFINANCE_AVAILABLE:
-                logger.info(f"Falling back to yfinance for historical data: {ticker}")
+            # Fall back to yfinance if available for non-authentication errors
+            if YFINANCE_AVAILABLE and not isinstance(api_error, YahooAuthenticationError):
+                logger.info(f"[{request_id}] Falling back to yfinance for historical data: {ticker}")
                 try:
-                    return self._fetch_historical_via_yfinance(ticker, period, interval)
+                    return self._fetch_historical_via_yfinance(ticker, period, interval, request_id)
                 except Exception as yf_error:
-                    logger.error(f"Error fetching historical data via yfinance: {yf_error}")
-                    return {
-                        'content': None,
-                        'content_type': 'json',
-                        'source': 'yahoo-historical',
-                        'status': 'error',
-                        'error': f"API error: {api_error}; yfinance error: {yf_error}",
-                        'metadata': {
-                            'ticker': ticker,
-                            'period': period,
-                            'interval': interval,
-                            'retrieved_at': timestamp_now()
-                        }
-                    }
+                    # Both approaches failed, wrap yfinance error and raise
+                    error_msg = f"Both direct API and yfinance failed for historical data for ticker {ticker}"
+                    logger.error(f"[{request_id}] {error_msg}: API error: {api_error}, yfinance error: {yf_error}")
+                    raise YahooError(error_msg, context=context, cause=yf_error)
             else:
-                # Only API approach was attempted
-                return {
-                    'content': None,
-                    'content_type': 'json',
-                    'source': 'yahoo-historical',
-                    'status': 'error',
-                    'error': f"API error: {api_error}; yfinance not available",
-                    'metadata': {
-                        'ticker': ticker,
-                        'period': period,
-                        'interval': interval,
-                        'retrieved_at': timestamp_now()
-                    }
-                }
+                # Just re-raise the original API error
+                raise
+        except Exception as e:
+            # Unexpected errors
+            error_msg = f"Unexpected error fetching historical data for ticker {ticker}"
+            logger.error(f"[{request_id}] {error_msg}: {e}")
+            raise YahooError(error_msg, context=context, cause=e)
     
-    async def _fetch_historical_via_api(self, ticker: str, period: str, interval: str) -> Dict[str, Any]:
+    async def _fetch_historical_via_api(self, ticker: str, period: str, interval: str, request_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Fetch historical prices using the direct API.
         
@@ -354,13 +482,29 @@ class YahooDataSource(BaseDataSource):
             ticker: Stock ticker symbol
             period: Time period for historical data
             interval: Data interval
+            request_id: Optional request ID for tracing and logging
             
         Returns:
             Data envelope with historical price data
             
         Raises:
-            ValueError: If API error occurs
+            YahooAuthenticationError: If authentication fails
+            YahooRateLimitError: If rate limit is exceeded
+            YahooNotFoundError: If ticker or historical data can't be found
+            YahooParsingError: If response parsing fails
+            YahooError: For other Yahoo API errors
+            DataSourceConnectionError: For network/connection issues
+            DataSourceTimeoutError: If the request times out
         """
+        # Create error context
+        context = ErrorContext(
+            request_id=request_id,
+            company={"ticker": ticker},
+            source_type="Yahoo-historical",
+            period=period,
+            interval=interval
+        )
+        
         # Construct the API URL for historical data
         url = f"{self.base_url}/chart/{ticker}"
         
@@ -372,66 +516,138 @@ class YahooDataSource(BaseDataSource):
             "events": "div,split"
         }
         
-        # Make the request
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                url,
-                params=query_params,
-                headers=self.headers,
-                timeout=REQUEST_TIMEOUT
-            )
-            
-            if resp.status_code != 200:
-                error_msg = f"Yahoo Finance API returned status {resp.status_code}: {resp.text}"
-                logger.error(error_msg)
-                raise ValueError(f"Yahoo Finance API error: {resp.status_code}")
+        logger.debug(f"[{request_id}] Yahoo Finance API chart request URL: {url}")
+        logger.debug(f"[{request_id}] Chart query parameters: {query_params}")
+        
+        # Implement retry with exponential backoff
+        max_retries = settings.worker.max_retries
+        base_delay = settings.worker.retry_delay_sec
+        attempt = 0
+        
+        while attempt < max_retries:
+            try:
+                logger.info(f"[{request_id}] Fetching historical data for ticker '{ticker}' via Yahoo API (attempt {attempt+1}/{max_retries})")
                 
-            data = resp.json()
-            
-            # Check for errors in response
-            if "chart" not in data or data.get("chart", {}).get("error"):
-                error = data.get("chart", {}).get("error", "Unknown error")
-                error_msg = f"Yahoo Finance API returned an error: {error}"
-                logger.error(error_msg)
-                raise ValueError(error_msg)
-                
-            # Extract the result
-            result = data.get("chart", {}).get("result", [])
-            
-            if not result:
-                error_msg = f"No historical data found for ticker '{ticker}'"
-                logger.warning(error_msg)
-                return {
-                    'content': None,
-                    'content_type': 'json',
-                    'source': 'yahoo-historical',
-                    'status': 'not_found',
-                    'error': error_msg,
-                    'metadata': {
-                        'ticker': ticker,
-                        'period': period,
-                        'interval': interval,
-                        'retrieved_at': timestamp_now()
+                # Make the request with timeout
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(
+                        url,
+                        params=query_params,
+                        headers=self.headers,
+                        timeout=REQUEST_TIMEOUT
+                    )
+                    
+                    logger.debug(f"[{request_id}] Yahoo Finance API chart status code: {resp.status_code}")
+                    
+                    # Handle different response status codes
+                    if resp.status_code == 401 or resp.status_code == 403:
+                        error_msg = f"Yahoo Finance API authentication failed: {resp.text}"
+                        logger.error(f"[{request_id}] {error_msg}")
+                        raise YahooAuthenticationError(error_msg, context=context)
+                        
+                    elif resp.status_code == 429:
+                        error_msg = f"Yahoo Finance API rate limit exceeded: {resp.text}"
+                        logger.error(f"[{request_id}] {error_msg}")
+                        raise YahooRateLimitError(error_msg, context=context)
+                        
+                    elif resp.status_code != 200:
+                        error_msg = f"Yahoo Finance API returned status {resp.status_code}: {resp.text}"
+                        logger.error(f"[{request_id}] {error_msg}")
+                        raise YahooError(error_msg, context=context)
+                    
+                    # Parse the response
+                    try:
+                        data = resp.json()
+                        logger.debug(f"[{request_id}] Yahoo API chart response received")
+                    except json.JSONDecodeError as e:
+                        error_msg = f"Failed to parse Yahoo Finance API chart response: {e}"
+                        logger.error(f"[{request_id}] {error_msg}")
+                        raise YahooParsingError(error_msg, context=context, cause=e)
+                    
+                    # Check for errors in response
+                    if "chart" not in data or data.get("chart", {}).get("error"):
+                        error = data.get("chart", {}).get("error", "Unknown error")
+                        error_msg = f"Yahoo Finance API chart returned an error: {error}"
+                        logger.error(f"[{request_id}] {error_msg}")
+                        raise YahooError(error_msg, context=context)
+                        
+                    # Extract the result
+                    result = data.get("chart", {}).get("result", [])
+                    
+                    if not result:
+                        error_msg = f"No historical data found for ticker '{ticker}'"
+                        logger.warning(f"[{request_id}] {error_msg}")
+                        raise YahooNotFoundError(error_msg, context=context)
+                        
+                    # Format the historical data
+                    historical_data = result[0]
+                    
+                    # Successful response, return the data envelope
+                    logger.info(f"[{request_id}] Successfully fetched historical data for ticker: {ticker}")
+                    return {
+                        'content': historical_data,
+                        'content_type': 'json',
+                        'source': 'yahoo-historical',
+                        'status': 'success',
+                        'metadata': {
+                            'ticker': ticker,
+                            'period': period,
+                            'interval': interval,
+                            'retrieved_at': timestamp_now()
+                        }
                     }
-                }
+                    
+            except httpx.TimeoutException as e:
+                attempt += 1
+                error_msg = f"Yahoo API chart request timed out: {e}"
+                logger.warning(f"[{request_id}] {error_msg}. Attempt {attempt}/{max_retries}")
                 
-            # Format the historical data
-            historical_data = result[0]
-            
-            return {
-                'content': historical_data,
-                'content_type': 'json',
-                'source': 'yahoo-historical',
-                'status': 'success',
-                'metadata': {
-                    'ticker': ticker,
-                    'period': period,
-                    'interval': interval,
-                    'retrieved_at': timestamp_now()
-                }
-            }
+                if attempt >= max_retries:
+                    raise DataSourceTimeoutError(error_msg, context=context, cause=e)
+                    
+                # Exponential backoff with jitter
+                jitter = 0.1 * base_delay * (random.random() * 2 - 1)
+                delay = min(base_delay * (2 ** (attempt - 1)) + jitter, 30.0)
+                logger.info(f"[{request_id}] Retrying in {delay:.2f}s")
+                await asyncio.sleep(delay)
+                
+            except httpx.RequestError as e:
+                attempt += 1
+                error_msg = f"Yahoo API chart connection error: {e}"
+                logger.warning(f"[{request_id}] {error_msg}. Attempt {attempt}/{max_retries}")
+                
+                if attempt >= max_retries:
+                    raise DataSourceConnectionError(error_msg, context=context, cause=e)
+                    
+                # Exponential backoff with jitter
+                jitter = 0.1 * base_delay * (random.random() * 2 - 1)
+                delay = min(base_delay * (2 ** (attempt - 1)) + jitter, 30.0)
+                logger.info(f"[{request_id}] Retrying in {delay:.2f}s")
+                await asyncio.sleep(delay)
+                
+            except (YahooAuthenticationError, YahooNotFoundError) as e:
+                # Don't retry authentication errors or not found errors
+                raise
+                
+            except (YahooError, SalescienceError) as e:
+                # For other Yahoo-specific errors, attempt retry if not at max
+                attempt += 1
+                if attempt >= max_retries:
+                    raise
+                    
+                # Exponential backoff with jitter
+                jitter = 0.1 * base_delay * (random.random() * 2 - 1)
+                delay = min(base_delay * (2 ** (attempt - 1)) + jitter, 30.0)
+                logger.info(f"[{request_id}] Retrying in {delay:.2f}s after error: {e.error_code}")
+                await asyncio.sleep(delay)
+                
+            except Exception as e:
+                # For unexpected errors, wrap in YahooError and raise
+                error_msg = f"Unexpected error fetching historical data for ticker '{ticker}': {e}"
+                logger.error(f"[{request_id}] {error_msg}")
+                raise YahooError(error_msg, context=context, cause=e)
     
-    def _fetch_historical_via_yfinance(self, ticker: str, period: str, interval: str) -> Dict[str, Any]:
+    def _fetch_historical_via_yfinance(self, ticker: str, period: str, interval: str, request_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Fetch historical prices using yfinance as a fallback.
         
@@ -439,40 +655,71 @@ class YahooDataSource(BaseDataSource):
             ticker: Stock ticker symbol
             period: Time period for historical data
             interval: Data interval
+            request_id: Optional request ID for tracing and logging
             
         Returns:
             Data envelope with historical price data
             
         Raises:
-            ValueError: If yfinance error occurs
+            MissingConfigurationError: If yfinance package is not installed
+            YahooNotFoundError: If ticker or historical data can't be found
+            YahooError: For other yfinance errors
         """
+        # Create error context
+        context = ErrorContext(
+            request_id=request_id,
+            company={"ticker": ticker},
+            source_type="Yahoo-historical-yfinance",
+            period=period,
+            interval=interval
+        )
+        
         if not YFINANCE_AVAILABLE:
-            raise ValueError("yfinance package is not installed")
+            error_msg = "yfinance package is not installed"
+            logger.error(f"[{request_id}] {error_msg}")
+            raise MissingConfigurationError(error_msg, context=context)
             
-        # Use yfinance to fetch historical data
-        yf_ticker = yf.Ticker(ticker)
-        hist = yf_ticker.history(period=period, interval=interval)
+        logger.info(f"[{request_id}] Fetching historical data for ticker '{ticker}' via yfinance")
         
-        # Check if we got any data
-        if hist.empty:
-            raise ValueError(f"No historical data found for ticker '{ticker}'")
+        try:
+            # Use yfinance to fetch historical data
+            yf_ticker = yf.Ticker(ticker)
+            hist = yf_ticker.history(period=period, interval=interval)
             
-        # Convert to dictionary (JSON-serializable)
-        hist_dict = hist.reset_index().to_dict(orient='records')
-        
-        return {
-            'content': hist_dict,
-            'content_type': 'json',
-            'source': 'yahoo-historical',
-            'status': 'success',
-            'metadata': {
-                'ticker': ticker,
-                'period': period,
-                'interval': interval,
-                'source_package': 'yfinance',
-                'retrieved_at': timestamp_now()
+            # Check if we got any data
+            if hist.empty:
+                error_msg = f"No historical data found for ticker '{ticker}'"
+                logger.warning(f"[{request_id}] {error_msg}")
+                raise YahooNotFoundError(error_msg, context=context)
+                
+            # Convert to dictionary (JSON-serializable)
+            hist_dict = hist.reset_index().to_dict(orient='records')
+            
+            logger.info(f"[{request_id}] Successfully fetched historical data for ticker '{ticker}' via yfinance")
+            return {
+                'content': hist_dict,
+                'content_type': 'json',
+                'source': 'yahoo-historical',
+                'status': 'success',
+                'metadata': {
+                    'ticker': ticker,
+                    'period': period,
+                    'interval': interval,
+                    'source_package': 'yfinance',
+                    'retrieved_at': timestamp_now()
+                }
             }
-        }
+        except YahooNotFoundError:
+            # Re-raise specific exceptions
+            raise
+        except SalescienceError:
+            # Re-raise other SalescienceErrors 
+            raise
+        except Exception as e:
+            # Wrap other exceptions in YahooError
+            error_msg = f"Error fetching historical data for ticker '{ticker}' via yfinance"
+            logger.error(f"[{request_id}] {error_msg}: {e}")
+            raise YahooError(error_msg, context=context, cause=e)
     
     async def fetch_recommendations(self, ticker: str) -> Dict[str, Any]:
         """

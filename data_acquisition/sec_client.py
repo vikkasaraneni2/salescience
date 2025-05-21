@@ -5,9 +5,17 @@ import asyncio          # Asynchronous I/O, event loop, and concurrency tools
 import redis            # Redis client for message bus and job queue implementation
 import json             # JSON parsing and serialization
 import time             # Time access and conversions
+import random           # For jitter in backoff strategies
 from typing import Dict, Any, List, Optional  # Type annotations
 from abc import ABC, abstractmethod           # Abstract base classes
 from config import settings  # Centralized configuration
+from data_acquisition.errors import (
+    SalescienceError, ErrorContext,
+    SECError, SECAuthenticationError, SECRateLimitError, SECNotFoundError, SECParsingError,
+    MissingConfigurationError, DataSourceConnectionError, DataSourceTimeoutError,
+    ValidationError, DataSourceNotFoundError,
+    log_error, format_error_response
+)
 
 # Get centralized logging configuration
 from data_acquisition.utils import configure_logging
@@ -149,7 +157,7 @@ def get_job_redis_key(organization_id: Optional[str], job_id: str, key_type: str
     return f"org:{organization_id}:job:{job_id}:{key_type}"
 
 
-def get_cik_for_ticker(ticker: str) -> str:
+def get_cik_for_ticker(ticker: str, request_id: Optional[str] = None) -> str:
     """
     Resolves a ticker symbol to a CIK (Central Index Key) using the sec-api.io mapping endpoint.
     
@@ -163,60 +171,126 @@ def get_cik_for_ticker(ticker: str) -> str:
     
     Args:
         ticker: The stock ticker symbol (e.g., 'AAPL', 'MSFT', 'GOOGL')
+        request_id: Optional request ID for tracing and logging
         
     Returns:
         Zero-padded CIK string (e.g., '0000320193' for Apple Inc.)
         
     Raises:
-        ValueError: If ticker can't be resolved, no SEC_API_KEY is available,
-                  or another API error occurs
+        MissingConfigurationError: If SEC_API_KEY is not set
+        SECNotFoundError: If ticker can't be resolved to a CIK
+        SECAuthenticationError: If authentication fails (401)
+        SECRateLimitError: If rate limit is exceeded (429)
+        SECError: For other SEC API errors
+        DataSourceConnectionError: For network/connection issues
+        DataSourceTimeoutError: If the request times out
     """
+    # Create error context with available information
+    context = ErrorContext(
+        request_id=request_id,
+        company={"ticker": ticker},
+        source_type="SEC"
+    )
+    
+    # Check for API key
     if not SEC_API_KEY:
         error_msg = "SEC_API_KEY is not set in the centralized configuration (settings.api_keys.sec)."
-        logger.error(error_msg)
-        # Provide clear error with configuration guidance
-        raise ValueError(error_msg)
+        logger.error(f"[{request_id}] {error_msg}")
+        raise MissingConfigurationError(error_msg, context=context)
     
     # Correct endpoint format based on SEC-API.io documentation
     url = f"{SEC_API_BASE_URL}/mapping/ticker/{ticker}?token={SEC_API_KEY}"
     
-    logger.info(f"Resolving ticker '{ticker}' to CIK via sec-api.io")
-    logger.debug(f"SEC API request URL: {url}")
+    logger.info(f"[{request_id}] Resolving ticker '{ticker}' to CIK via sec-api.io")
+    logger.debug(f"[{request_id}] SEC API request URL: {url}")
     
-    try:
-        resp = httpx.get(url, timeout=10.0)
-        
-        # Log response details for debugging
-        logger.debug(f"SEC API status code: {resp.status_code}")
-        logger.debug(f"SEC API response headers: {resp.headers}")
-        
-        if resp.status_code != 200:
-            error_msg = f"SEC API returned status {resp.status_code}: {resp.text}"
-            logger.error(error_msg)
-            raise ValueError(f"sec-api.io error: {resp.status_code}")
-        
-        # Parse the response
-        data = resp.json()
-        logger.debug(f"SEC API response: {data}")
-        
-        # The API returns a list of results
-        if isinstance(data, list) and len(data) > 0:
-            # Get CIK from first result
-            cik = data[0].get("cik")
-            if cik:
-                padded_cik = str(cik).zfill(10)
-                logger.info(f"Resolved ticker '{ticker}' to CIK '{padded_cik}'")
-                return padded_cik
-        
-        # If we got no matches or no CIK field, raise an error
-        error_msg = f"Ticker '{ticker}' not found in SEC API response: {data}"
-        logger.error(error_msg)
-        raise ValueError(f"Ticker '{ticker}' not found in SEC API response.")
-        
-    except Exception as e:
-        error_msg = f"Error fetching CIK for ticker '{ticker}' from SEC API: {e}"
-        logger.error(error_msg)
-        raise ValueError(error_msg)
+    # Implement retry with exponential backoff
+    max_retries = settings.worker.max_retries
+    base_delay = settings.worker.retry_delay_sec
+    attempt = 0
+    
+    while attempt < max_retries:
+        try:
+            resp = httpx.get(url, timeout=settings.sec_request_timeout_sec)
+            
+            # Log response details for debugging
+            logger.debug(f"[{request_id}] SEC API status code: {resp.status_code}")
+            
+            # Handle different response status codes with specific errors
+            if resp.status_code == 401 or resp.status_code == 403:
+                error_msg = f"SEC API authentication failed: {resp.text}"
+                logger.error(f"[{request_id}] {error_msg}")
+                raise SECAuthenticationError(error_msg, context=context)
+                
+            elif resp.status_code == 429:
+                error_msg = f"SEC API rate limit exceeded: {resp.text}"
+                logger.error(f"[{request_id}] {error_msg}")
+                raise SECRateLimitError(error_msg, context=context)
+                
+            elif resp.status_code != 200:
+                error_msg = f"SEC API returned status {resp.status_code}: {resp.text}"
+                logger.error(f"[{request_id}] {error_msg}")
+                raise SECError(error_msg, context=context)
+            
+            # Parse the response
+            try:
+                data = resp.json()
+                logger.debug(f"[{request_id}] SEC API response: {data}")
+            except json.JSONDecodeError as e:
+                error_msg = f"Failed to parse SEC API response: {e}"
+                logger.error(f"[{request_id}] {error_msg}")
+                raise SECParsingError(error_msg, context=context, cause=e)
+            
+            # The API returns a list of results
+            if isinstance(data, list) and len(data) > 0:
+                # Get CIK from first result
+                cik = data[0].get("cik")
+                if cik:
+                    padded_cik = str(cik).zfill(10)
+                    logger.info(f"[{request_id}] Resolved ticker '{ticker}' to CIK '{padded_cik}'")
+                    return padded_cik
+            
+            # If we got no matches or no CIK field, raise an error
+            error_msg = f"Ticker '{ticker}' not found in SEC API response"
+            logger.error(f"[{request_id}] {error_msg}: {data}")
+            raise SECNotFoundError(error_msg, context=context)
+            
+        except httpx.TimeoutException as e:
+            attempt += 1
+            error_msg = f"SEC API request timed out: {e}"
+            logger.warning(f"[{request_id}] {error_msg}. Attempt {attempt}/{max_retries}")
+            
+            if attempt >= max_retries:
+                raise DataSourceTimeoutError(error_msg, context=context, cause=e)
+                
+            # Exponential backoff with jitter
+            jitter = 0.1 * base_delay * (random.random() * 2 - 1)
+            delay = min(base_delay * (2 ** (attempt - 1)) + jitter, 30.0)
+            logger.info(f"[{request_id}] Retrying in {delay:.2f}s")
+            time.sleep(delay)
+            
+        except httpx.RequestError as e:
+            attempt += 1
+            error_msg = f"SEC API connection error: {e}"
+            logger.warning(f"[{request_id}] {error_msg}. Attempt {attempt}/{max_retries}")
+            
+            if attempt >= max_retries:
+                raise DataSourceConnectionError(error_msg, context=context, cause=e)
+                
+            # Exponential backoff with jitter
+            jitter = 0.1 * base_delay * (random.random() * 2 - 1)
+            delay = min(base_delay * (2 ** (attempt - 1)) + jitter, 30.0)
+            logger.info(f"[{request_id}] Retrying in {delay:.2f}s")
+            time.sleep(delay)
+            
+        except (SECError, SalescienceError):
+            # Re-raise SalescienceErrors without retrying
+            raise
+            
+        except Exception as e:
+            error_msg = f"Unexpected error fetching CIK for ticker '{ticker}' from SEC API: {e}"
+            logger.error(f"[{request_id}] {error_msg}")
+            raise SECError(error_msg, context=context, cause=e)
 
 
 class SECDataSource(BaseDataSource):
@@ -292,12 +366,19 @@ class SECDataSource(BaseDataSource):
         
         logger.info(f"Fetching SEC filing: ticker={ticker}, cik={cik}, form_type={form_type}, year={year}")
         
+        # Create error context
+        context = ErrorContext(
+            company={"ticker": ticker, "cik": cik},
+            source_type="SEC",
+            form_type=form_type,
+            year=year
+        )
+        
         # Verify API key is available from centralized configuration
         if not SEC_API_KEY:
             error_msg = "SEC_API_KEY is not set in the centralized configuration (settings.api_keys.sec)."
             logger.error(error_msg)
-            # Provide clear error with configuration guidance
-            raise ValueError(error_msg)
+            raise MissingConfigurationError(error_msg, context=context)
             
         # Log user agent and contact info for SEC compliance
         headers = {
@@ -314,7 +395,9 @@ class SECDataSource(BaseDataSource):
                 cik = get_cik_for_ticker(ticker)
                 logger.info(f"Ticker {ticker} resolved to CIK {cik}")
             else:
-                raise ValueError("Parameter 'cik' or 'ticker' is required for SECDataSource.fetch")
+                error_msg = "Parameter 'cik' or 'ticker' is required for SECDataSource.fetch"
+                logger.error(error_msg)
+                raise ValidationError(error_msg, context=context)
         
         try:
             # Construct the SEC API query for filings
@@ -349,7 +432,14 @@ class SECDataSource(BaseDataSource):
             if resp.status_code != 200:
                 error_msg = f"SEC API query returned status {resp.status_code}: {resp.text}"
                 logger.error(error_msg)
-                raise ValueError(f"SEC API query error: {resp.status_code}")
+                
+                # Map error based on status code
+                if resp.status_code == 401 or resp.status_code == 403:
+                    raise SECAuthenticationError(f"SEC API authentication failed: {resp.text}", context=context)
+                elif resp.status_code == 429:
+                    raise SECRateLimitError(f"SEC API rate limit exceeded: {resp.text}", context=context)
+                else:
+                    raise SECError(f"SEC API query error: {resp.status_code} - {resp.text}", context=context)
             
             # Process the response
             query_result = resp.json()
@@ -359,7 +449,7 @@ class SECDataSource(BaseDataSource):
             if not filings:
                 error_msg = f"No {form_type} filings found for CIK {cik} (year={year}) via SEC API."
                 logger.warning(error_msg)
-                raise ValueError(error_msg)
+                raise SECNotFoundError(error_msg, context=context)
             
             # Get the most recent filing
             filing = filings[0]
@@ -589,11 +679,427 @@ class SECDataSource(BaseDataSource):
             logger.error(f"Error fetching Form 8-K filings from SEC API: {e}")
             raise ValueError(f"Error fetching Form 8-K filings from SEC API: {e}")
     
-    def fetch_last_n_years(self, params: Dict[str, Any], n_years: int = 5, form_type: str = '10-K') -> List[Dict[str, Any]]:
+    def _validate_and_resolve_params(self, params: Dict[str, Any], request_id: Optional[str] = None) -> Tuple[str, Optional[str]]:
+    """
+    Validate and resolve company parameters.
+    
+    Args:
+        params: Dictionary with company identification parameters
+        request_id: Optional request ID for tracing
+        
+    Returns:
+        Tuple of (cik, ticker) where cik is the resolved 10-digit CIK
+        
+    Raises:
+        ValidationError: If required parameters are missing
+        SECError: If CIK resolution fails
+    """
+    # Create error context
+    context = ErrorContext(
+        request_id=request_id,
+        company=params,
+        source_type="SEC"
+    )
+    
+    # Extract ticker and CIK from params
+    ticker = params.get('ticker')
+    cik = params.get('cik')
+    
+    logger.info(f"[{request_id}] Validating company parameters: ticker={ticker}, cik={cik}")
+    
+    # Validate that we have at least ticker or CIK
+    if not ticker and not cik:
+        error_msg = "Parameter 'ticker' or 'cik' is required"
+        logger.error(f"[{request_id}] {error_msg}")
+        raise ValidationError(error_msg, context=context)
+        
+    # Resolve ticker to CIK if needed
+    if not cik and ticker:
+        try:
+            logger.info(f"[{request_id}] Resolving ticker {ticker} to CIK")
+            cik = get_cik_for_ticker(ticker, request_id)
+            logger.info(f"[{request_id}] Ticker {ticker} resolved to CIK {cik}")
+        except Exception as e:
+            error_msg = f"Failed to resolve ticker {ticker} to CIK"
+            logger.error(f"[{request_id}] {error_msg}: {e}")
+            raise SECError(error_msg, context=context, cause=e)
+    
+    # Ensure CIK is properly formatted
+    if cik:
+        cik = str(cik).zfill(10)
+    
+    return cik, ticker
+
+def _build_sec_api_query(self, cik: str, form_type: str, start_year: int, end_year: int, max_results: int = 10) -> Dict[str, Any]:
+    """
+    Build SEC API query for filings.
+    
+    Args:
+        cik: Company CIK (10-digit padded)
+        form_type: SEC form type to fetch
+        start_year: Start year for query range
+        end_year: End year for query range
+        max_results: Maximum number of results to return
+        
+    Returns:
+        Dictionary with SEC API query parameters
+    """
+    # Build the query with date range filter
+    query = {
+        "query": {
+            "query_string": {
+                "query": f"formType:\"{form_type}\" AND cik:{cik.lstrip('0')} AND filedAt:[{start_year}-01-01 TO {end_year}-12-31]"
+            }
+        },
+        "from": "0",
+        "size": str(max_results),
+        "sort": [{"filedAt": {"order": "desc"}}]
+    }
+    
+    return query
+
+def _execute_sec_api_query(self, query: Dict[str, Any], request_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Execute SEC API query and handle responses.
+    
+    Args:
+        query: SEC API query to execute
+        request_id: Optional request ID for tracing
+        
+    Returns:
+        List of filing metadata
+        
+    Raises:
+        SECAuthenticationError: If authentication fails
+        SECRateLimitError: If rate limit is exceeded
+        SECError: For other SEC API errors
+        SECNotFoundError: If no filings are found
+    """
+    # Create error context
+    context = ErrorContext(
+        request_id=request_id,
+        source_type="SEC",
+        query=query
+    )
+    
+    # Set up API URL
+    query_url = f"{SEC_API_BASE_URL}?token={SEC_API_KEY}"
+    
+    # Set up headers
+    headers = {
+        "User-Agent": settings.sec_user_agent,
+        "Accept": "application/json",
+    }
+    
+    logger.info(f"[{request_id}] Executing SEC API query for filings")
+    logger.debug(f"[{request_id}] SEC API query: {query}")
+    
+    try:
+        # Execute the query
+        resp = httpx.post(query_url, json=query, headers=headers, timeout=settings.sec_request_timeout_sec)
+        
+        # Log response details
+        logger.debug(f"[{request_id}] SEC API status code: {resp.status_code}")
+        
+        # Handle different status codes
+        if resp.status_code == 401 or resp.status_code == 403:
+            error_msg = f"SEC API authentication failed: {resp.text}"
+            logger.error(f"[{request_id}] {error_msg}")
+            raise SECAuthenticationError(error_msg, context=context)
+            
+        elif resp.status_code == 429:
+            error_msg = f"SEC API rate limit exceeded: {resp.text}"
+            logger.error(f"[{request_id}] {error_msg}")
+            raise SECRateLimitError(error_msg, context=context)
+            
+        elif resp.status_code != 200:
+            error_msg = f"SEC API returned status {resp.status_code}: {resp.text}"
+            logger.error(f"[{request_id}] {error_msg}")
+            raise SECError(error_msg, context=context)
+        
+        # Parse the response
+        try:
+            data = resp.json()
+            logger.debug(f"[{request_id}] SEC API response: {data}")
+        except json.JSONDecodeError as e:
+            error_msg = f"Failed to parse SEC API response"
+            logger.error(f"[{request_id}] {error_msg}: {e}")
+            raise SECParsingError(error_msg, context=context, cause=e)
+        
+        # Extract filings
+        filings = data.get('filings', [])
+        
+        # Check if we got any filings
+        if not filings:
+            error_msg = f"No filings found in SEC API response"
+            logger.warning(f"[{request_id}] {error_msg}")
+            raise SECNotFoundError(error_msg, context=context)
+        
+        return filings
+        
+    except httpx.TimeoutException as e:
+        error_msg = f"SEC API request timed out"
+        logger.error(f"[{request_id}] {error_msg}: {e}")
+        raise DataSourceTimeoutError(error_msg, context=context, cause=e)
+        
+    except httpx.RequestError as e:
+        error_msg = f"SEC API connection error"
+        logger.error(f"[{request_id}] {error_msg}: {e}")
+        raise DataSourceConnectionError(error_msg, context=context, cause=e)
+        
+    except (SECError, SalescienceError):
+        # Re-raise SalescienceErrors
+        raise
+        
+    except Exception as e:
+        error_msg = f"Unexpected error executing SEC API query"
+        logger.error(f"[{request_id}] {error_msg}: {e}")
+        raise SECError(error_msg, context=context, cause=e)
+
+def _get_document_url(self, filing: Dict[str, Any], cik: str, form_type: str, request_id: Optional[str] = None) -> Tuple[List[str], str]:
+    """
+    Get document URLs from filing metadata with fallback strategies.
+    
+    Args:
+        filing: Filing metadata
+        cik: Company CIK
+        form_type: SEC form type
+        request_id: Optional request ID for tracing
+        
+    Returns:
+        Tuple of (urls_to_try, content_type) where:
+            - urls_to_try is a list of URLs to try in order
+            - content_type is the expected content type
+    """
+    urls_to_try = []
+    content_type = 'txt'  # Default to text
+    
+    # Extract accession number for fallback URLs
+    accession_no = filing.get('accessionNo', '').replace('-', '')
+    cik_no_leading_zeros = cik.lstrip('0')
+    
+    logger.debug(f"[{request_id}] Extracting document URLs for filing: {accession_no}")
+    
+    # 1. Try URLs from filing metadata (most reliable)
+    if filing.get('linkToFilingDetails'):
+        urls_to_try.append(filing.get('linkToFilingDetails'))
+        content_type = 'html'
+    
+    if filing.get('linkToTxt'):
+        urls_to_try.append(filing.get('linkToTxt'))
+        content_type = 'txt'
+        
+    if filing.get('linkToHtml'):
+        urls_to_try.append(filing.get('linkToHtml'))
+        content_type = 'html'
+        
+    # 2. Check document format files
+    if 'documentFormatFiles' in filing and filing['documentFormatFiles']:
+        for doc in filing['documentFormatFiles']:
+            # Look for the main form document
+            if doc.get('documentUrl') and (doc.get('type') == form_type or 
+                                           doc.get('type') == '10-K' or 
+                                           doc.get('description', '').lower() == 'complete submission text file'):
+                urls_to_try.append(doc.get('documentUrl'))
+                content_type = 'html' if doc.get('documentUrl', '').endswith(('.htm', '.html')) else 'txt'
+    
+    # 3. Fallback URLs based on SEC EDGAR structure
+    if filing.get('primaryDocument'):
+        # Primary URL from SEC EDGAR
+        urls_to_try.append(f"{SEC_EDGAR_BASE_URL}/{cik_no_leading_zeros}/{accession_no}/{filing.get('primaryDocument')}")
+        # Alternative URL format
+        urls_to_try.append(f"{SEC_EDGAR_BASE_URL}/{cik_no_leading_zeros}/{accession_no.replace('-', '')}/{filing.get('primaryDocument')}")
+    
+    # 4. Complete submission text file
+    urls_to_try.append(f"{SEC_EDGAR_BASE_URL}/{cik_no_leading_zeros}/{accession_no}/{accession_no}.txt")
+    urls_to_try.append(f"{SEC_EDGAR_BASE_URL}/{cik_no_leading_zeros}/{accession_no.replace('-', '')}/{accession_no.replace('-', '')}.txt")
+    
+    logger.debug(f"[{request_id}] Found {len(urls_to_try)} possible URLs for filing {accession_no}")
+    
+    # Set content type based on URL extensions
+    content_type = 'html' if urls_to_try and urls_to_try[0].endswith(('.htm', '.html')) else 'txt'
+    
+    return urls_to_try, content_type
+
+def _fetch_document_content(self, urls: List[str], headers: Dict[str, str], request_id: Optional[str] = None) -> Tuple[Optional[str], Optional[str], str]:
+    """
+    Fetch document content from URLs.
+    
+    Args:
+        urls: List of URLs to try in order
+        headers: HTTP headers for request
+        request_id: Optional request ID for tracing
+        
+    Returns:
+        Tuple of (document_content, successful_url, content_type) where:
+            - document_content is the fetched content
+            - successful_url is the URL that worked
+            - content_type is determined from the URL
+    """
+    # Create error context
+    context = ErrorContext(
+        request_id=request_id,
+        source_type="SEC",
+        urls=urls
+    )
+    
+    # Try each URL until we get a successful response
+    for url in urls:
+        try:
+            logger.debug(f"[{request_id}] Trying to fetch document from: {url}")
+            
+            # Determine content type from URL
+            content_type = 'html' if url.endswith(('.htm', '.html')) else 'txt'
+            
+            # Fetch the document
+            doc_resp = httpx.get(url, headers=headers, timeout=settings.sec_request_timeout_sec)
+            
+            if doc_resp.status_code == 200:
+                document_content = doc_resp.text
+                logger.info(f"[{request_id}] Successfully fetched document from {url}")
+                return document_content, url, content_type
+            else:
+                logger.debug(f"[{request_id}] Failed to fetch from {url}: HTTP {doc_resp.status_code}")
+                
+        except Exception as e:
+            logger.debug(f"[{request_id}] Error fetching from {url}: {e}")
+    
+    # If we get here, all URLs failed
+    error_msg = "Could not fetch document from any source URL"
+    logger.error(f"[{request_id}] {error_msg}")
+    raise SECNotFoundError(error_msg, context=context)
+
+def _create_filing_envelope(self, content: Optional[str], status: str, metadata: Dict[str, Any], 
+                           error: Optional[str] = None, request_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Create response envelope for a filing.
+    
+    Args:
+        content: Document content (None for error cases)
+        status: Response status (success, error, not_found)
+        metadata: Filing metadata
+        error: Optional error message
+        request_id: Optional request ID for tracing
+        
+    Returns:
+        Standardized response envelope
+    """
+    # Create base envelope structure
+    envelope = {
+        'content': content,
+        'content_type': metadata.get('content_type', 'txt'),
+        'source': 'sec',
+        'status': status,
+        'metadata': {
+            'cik': metadata.get('cik'),
+            'ticker': metadata.get('ticker'),
+            'form_type': metadata.get('form_type'),
+            'year': metadata.get('year'),
+            'retrieved_at': datetime.datetime.utcnow().isoformat() + 'Z',
+        }
+    }
+    
+    # Add additional metadata if available
+    if 'filing_info' in metadata:
+        envelope['metadata']['filing_info'] = metadata['filing_info']
+        
+    if 'filing_url' in metadata:
+        envelope['metadata']['filing_url'] = metadata['filing_url']
+    
+    # Add error information if provided
+    if error:
+        envelope['error'] = error
+        envelope['status'] = 'error'  # Ensure status is error when error message exists
+    
+    logger.debug(f"[{request_id}] Created filing envelope with status: {status}")
+    
+    return envelope
+
+def _process_single_filing(self, filing: Dict[str, Any], cik: str, ticker: Optional[str], 
+                           form_type: str, headers: Dict[str, str], request_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Process a single filing from metadata to final envelope.
+    
+    Args:
+        filing: Filing metadata
+        cik: Company CIK
+        ticker: Company ticker
+        form_type: SEC form type
+        headers: HTTP headers for requests
+        request_id: Optional request ID for tracing
+        
+    Returns:
+        Filing result envelope
+    """
+    try:
+        # Extract filing year
+        filed_at = filing.get('filedAt', '')
+        year = filed_at[:4] if filed_at else None
+        
+        logger.info(f"[{request_id}] Processing {form_type} filing for year {year}")
+        
+        # Get document URLs
+        urls_to_try, content_type = self._get_document_url(filing, cik, form_type, request_id)
+        
+        # Fetch document content
+        document_content, doc_url, content_type = self._fetch_document_content(urls_to_try, headers, request_id)
+        
+        # Create success envelope
+        return self._create_filing_envelope(
+            content=document_content,
+            status="success",
+            metadata={
+                'cik': cik,
+                'ticker': ticker,
+                'form_type': form_type,
+                'year': year,
+                'filing_info': filing,
+                'filing_url': doc_url,
+                'content_type': content_type
+            },
+            request_id=request_id
+        )
+        
+    except (SECError, SalescienceError) as e:
+        # Create error envelope for specific known errors
+        return self._create_filing_envelope(
+            content=None,
+            status="error",
+            metadata={
+                'cik': cik,
+                'ticker': ticker,
+                'form_type': form_type,
+                'year': year if 'year' in locals() else None,
+                'filing_info': filing
+            },
+            error=str(e),
+            request_id=request_id
+        )
+        
+    except Exception as e:
+        # Create error envelope for unexpected errors
+        error_msg = f"Unexpected error processing filing: {e}"
+        logger.error(f"[{request_id}] {error_msg}")
+        
+        return self._create_filing_envelope(
+            content=None,
+            status="error",
+            metadata={
+                'cik': cik,
+                'ticker': ticker,
+                'form_type': form_type,
+                'year': year if 'year' in locals() else None,
+                'filing_info': filing
+            },
+            error=error_msg,
+            request_id=request_id
+        )
+
+def fetch_last_n_years(self, params: Dict[str, Any], n_years: int = 5, form_type: str = '10-K', request_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Fetch filings for the last N years for a specific company.
         
-        This method retrieves SEC filings (default: 10-K annual reports) for the specified 
+        This method retrieves SEC filings (default: 10-K annual reports) for the specified
         number of years, attempting to get one filing per year. It handles all the 
         complexity of finding and retrieving these documents from multiple potential
         sources, with fallback options for reliability.
