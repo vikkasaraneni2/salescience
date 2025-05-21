@@ -127,30 +127,53 @@ Configuration Settings:
 import uuid
 import logging
 import json
+from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, Query, Request, Header
+from pydantic import BaseModel, Field, validator, root_validator
 import redis
 from config import settings
-from data_acquisition.json_logger import JsonLogger
+
+# Import error handling framework
+from data_acquisition.errors import (
+    SalescienceError, ErrorContext, format_error_response,
+    ValidationError, AuthorizationError, RedisError, RedisOperationError,
+    APIError, DataSourceNotFoundError, MissingConfigurationError,
+    DataSourceError
+)
+
+# Import error handlers
+from data_acquisition.error_handlers import register_exception_handlers
+
+# Import utilities
+from data_acquisition.utils import get_job_redis_key, timestamp_now, JsonLogger
 
 # Configure logging using centralized settings
 logging.basicConfig(level=getattr(logging, settings.log_level))
 logger = logging.getLogger("orchestrator_api")
 
-# Redis connection from centralized settings
-REDIS_URL = settings.redis.url
-redis_client = redis.Redis.from_url(
-    REDIS_URL, 
-    decode_responses=True,
-    password=settings.redis.password,
-    ssl=settings.redis.ssl,
-    socket_timeout=settings.redis.socket_timeout,
-    socket_connect_timeout=settings.redis.socket_connect_timeout,
-    retry_on_timeout=settings.redis.retry_on_timeout
-)
+# Initialize Redis client with better error handling
+try:
+    redis_client = redis.Redis.from_url(
+        settings.redis.url,
+        decode_responses=True,
+        password=settings.redis.password,
+        ssl=settings.redis.ssl,
+        socket_timeout=settings.redis.socket_timeout,
+        socket_connect_timeout=settings.redis.socket_connect_timeout,
+        retry_on_timeout=settings.redis.retry_on_timeout
+    )
+    # Test connection
+    redis_client.ping()
+    logger.info("Successfully connected to Redis")
+except Exception as e:
+    logger.error(f"Failed to connect to Redis: {e}")
+    raise MissingConfigurationError(
+        f"Could not connect to Redis at {settings.redis.url}: {e}",
+        context=ErrorContext(source_type="Redis")
+    )
 
-# Replace logger with structured JSON logger
+# Initialize structured logger
 json_logger = JsonLogger("orchestrator_api")
 
 # Pydantic models for request/response validation
@@ -179,6 +202,48 @@ class CompanyRequest(BaseModel):
     cik: Optional[str] = Field(None, description="SEC CIK identifier")
     sec: Optional[bool] = Field(False, description="Whether to fetch SEC data for this company")
     yahoo: Optional[bool] = Field(False, description="Whether to fetch Yahoo data for this company")
+    
+    @root_validator
+    def validate_identifiers(cls, values):
+        """Validate that at least one company identifier is provided."""
+        if not any((values.get('name'), values.get('ticker'), values.get('cik'))):
+            raise ValidationError(
+                "At least one company identifier (name, ticker, or cik) must be provided",
+                context=ErrorContext(company=values)
+            )
+        return values
+    
+    @validator('ticker')
+    def validate_ticker_format(cls, v):
+        """Validate ticker format if provided."""
+        if v is not None and (not v.isalnum() or len(v) > 5):
+            raise ValidationError(
+                "Ticker must be alphanumeric and 5 characters or less",
+                context=ErrorContext(ticker=v)
+            )
+        return v
+    
+    @validator('cik')
+    def validate_cik_format(cls, v):
+        """Validate CIK format if provided."""
+        if v is not None:
+            # CIK should be numeric or 10-digit string with leading zeros
+            if not (v.isdigit() or (v.startswith('0') and len(v) == 10 and v.replace('0', '').isdigit())):
+                raise ValidationError(
+                    "CIK must be numeric or a 10-digit string with leading zeros",
+                    context=ErrorContext(cik=v)
+                )
+        return v
+    
+    @root_validator
+    def validate_yahoo_requires_ticker(cls, values):
+        """Validate that Yahoo data requests include a ticker."""
+        if values.get('yahoo') and not values.get('ticker'):
+            raise ValidationError(
+                "Yahoo data acquisition requires a ticker symbol",
+                context=ErrorContext(company=values)
+            )
+        return values
 
 class SubmitJobsRequest(BaseModel):
     """
@@ -203,6 +268,54 @@ class SubmitJobsRequest(BaseModel):
     form_type: Optional[str] = Field("10-K", description="SEC form type to fetch (e.g., '10-K')")
     organization_id: str = Field(..., description="Organization ID for multi-tenancy")  # Required for tenant isolation
     user_id: Optional[str] = Field(None, description="User ID (optional, for audit)")    # Optional, for audit trails
+    
+    @validator('n_years')
+    def validate_n_years(cls, v):
+        """Validate years range."""
+        if v < 1 or v > 10:
+            raise ValidationError(
+                "n_years must be between 1 and 10",
+                context=ErrorContext(n_years=v)
+            )
+        return v
+    
+    @validator('form_type')
+    def validate_form_type(cls, v):
+        """Validate form type."""
+        valid_form_types = [
+            '10-K', '10-Q', '8-K', '20-F', '40-F',
+            'DEF 14A', 'DEFA14A', 'DEFM14A',
+            'S-1', 'S-3', 'S-4', 'F-1',
+            '4', '13F', '13G', '13D',
+            'SD', 'CORRESP', 'FWP',
+            '10-K/A', '10-Q/A', '8-K/A'
+        ]
+        if v not in valid_form_types:
+            raise ValidationError(
+                f"Invalid form_type. Must be one of: {', '.join(valid_form_types)}",
+                context=ErrorContext(form_type=v)
+            )
+        return v
+    
+    @validator('companies')
+    def validate_companies_not_empty(cls, v):
+        """Validate companies list is not empty."""
+        if not v:
+            raise ValidationError(
+                "At least one company must be specified",
+                context=ErrorContext()
+            )
+        return v
+    
+    @validator('organization_id')
+    def validate_organization_id(cls, v):
+        """Validate organization ID format."""
+        if not v or len(v) < 3:
+            raise ValidationError(
+                "Organization ID must be at least 3 characters",
+                context=ErrorContext(organization_id=v)
+            )
+        return v
 
 class SubmitJobsResponse(BaseModel):
     """
@@ -269,6 +382,13 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc"
 )
+
+# Register exception handlers
+register_exception_handlers(app)
+
+# Import and register health check endpoints
+from data_acquisition.health import router as health_router
+app.include_router(health_router)
 
 # Utility: Generate a new job ID
 def generate_job_id() -> str:
@@ -445,43 +565,69 @@ def submit_jobs(request: SubmitJobsRequest):
     Raises:
         HTTPException: If the request is invalid or processing fails
     """
-    print("DEBUG: CompanyRequest fields:", CompanyRequest.__fields__)
-    print("DEBUG: Received companies:", request.companies)
-    print("DEBUG: Company dicts:", [c.dict() for c in request.companies])
-    if not request.companies:
-        json_logger.log_json(
-            level="warning",
-            action="submit_job",
-            message="No companies provided in job submission",
-            organization_id=request.organization_id,
-            status="rejected",
-            extra={"user_id": request.user_id}
-        )
-        raise HTTPException(status_code=400, detail="No companies provided.")
-    if not request.organization_id:
-        json_logger.log_json(
-            level="warning",
-            action="submit_job",
-            message="organization_id is required in job submission",
-            status="rejected",
-            extra={"user_id": request.user_id}
-        )
-        raise HTTPException(status_code=400, detail="organization_id is required.")
-    job_id = generate_job_id()
-    json_logger.log_json(
-        level="info",
-        action="submit_job",
-        message="Job submitted",
+    request_id = str(uuid.uuid4())
+    context = ErrorContext(
+        operation="submit_jobs",
+        request_id=request_id,
         organization_id=request.organization_id,
-        job_id=job_id,
-        status="submitted",
-        extra={"user_id": request.user_id, "num_companies": len(request.companies)}
+        companies=[c.dict() for c in request.companies] if request.companies else [],
+        form_type=request.form_type,
+        n_years=request.n_years,
+        user_id=request.user_id
     )
-    n_years = request.n_years or 1
-    form_type = request.form_type or "10-K"
-    init_job_in_redis(job_id, request.companies, n_years, form_type, request.organization_id, request.user_id)
-    enqueue_job(job_id, request.companies, n_years, form_type, request.organization_id, request.user_id)
-    return SubmitJobsResponse(job_ids=[job_id])
+    
+    try:
+        logger.info(f"[{request_id}] Submitting job for {len(request.companies)} companies")
+        
+        # Generate job ID
+        job_id = generate_job_id()
+        
+        # Get parameters with defaults
+        n_years = request.n_years or 1
+        form_type = request.form_type or "10-K"
+        
+        # Initialize job tracking in Redis
+        try:
+            init_job_in_redis(job_id, request.companies, n_years, form_type, request.organization_id, request.user_id)
+        except Exception as e:
+            logger.error(f"[{request_id}] Failed to initialize job in Redis: {e}")
+            raise RedisOperationError(
+                "Failed to initialize job tracking",
+                context=context.with_update(job_id=job_id, operation="init_job_in_redis")
+            )
+        
+        # Enqueue job for processing
+        try:
+            enqueue_job(job_id, request.companies, n_years, form_type, request.organization_id, request.user_id)
+        except Exception as e:
+            logger.error(f"[{request_id}] Failed to enqueue job: {e}")
+            raise RedisOperationError(
+                "Failed to enqueue job for processing",
+                context=context.with_update(job_id=job_id, operation="enqueue_job")
+            )
+        
+        # Log successful submission
+        json_logger.log_json(
+            level="info",
+            action="submit_job",
+            message="Job submitted successfully",
+            organization_id=request.organization_id,
+            job_id=job_id,
+            status="submitted",
+            extra={"user_id": request.user_id, "num_companies": len(request.companies), "request_id": request_id}
+        )
+        
+        logger.info(f"[{request_id}] Successfully submitted job {job_id}")
+        return SubmitJobsResponse(job_ids=[job_id])
+        
+    except (ValidationError, RedisOperationError):
+        raise
+    except Exception as e:
+        logger.error(f"[{request_id}] Unexpected error in submit_jobs: {e}")
+        raise SalescienceError(
+            "Failed to submit job due to internal error",
+            context=context
+        )
 
 # Endpoint: Check job status
 @app.get("/status/{job_id}", response_model=JobStatusResponse, tags=["Jobs"])
@@ -506,38 +652,81 @@ def get_job_status(job_id: str, organization_id: str = Query(..., description="O
     Raises:
         HTTPException: If the job doesn't exist or belongs to a different organization
     """
-    meta = redis_client.hgetall(get_job_redis_key(organization_id, job_id, "meta"))
-    if not meta or meta.get("organization_id") != organization_id:
-        json_logger.log_json(
-            level="warning",
-            action="get_job_status",
-            message="Forbidden status check: organization_id does not match",
-            organization_id=organization_id,
-            job_id=job_id,
-            status="forbidden"
-        )
-        raise HTTPException(status_code=403, detail="Forbidden: organization_id does not match.")
-    status = redis_client.hgetall(get_job_redis_key(organization_id, job_id, "status"))
-    if not status:
-        json_logger.log_json(
-            level="warning",
-            action="get_job_status",
-            message="Job not found",
-            organization_id=organization_id,
-            job_id=job_id,
-            status="not_found"
-        )
-        raise HTTPException(status_code=404, detail="Job not found.")
-    overall_status = redis_client.get(get_job_redis_key(organization_id, job_id, "overall_status")) or "unknown"
-    json_logger.log_json(
-        level="info",
-        action="get_job_status",
-        message="Status check successful",
+    request_id = str(uuid.uuid4())
+    context = ErrorContext(
+        operation="get_job_status",
+        request_id=request_id,
         organization_id=organization_id,
-        job_id=job_id,
-        status=overall_status
+        job_id=job_id
     )
-    return JobStatusResponse(job_id=job_id, status=overall_status, sources=status)
+    
+    try:
+        logger.debug(f"[{request_id}] Checking status for job {job_id}")
+        
+        # Get job metadata and verify organization access
+        try:
+            meta = redis_client.hgetall(get_job_redis_key(organization_id, job_id, "meta"))
+        except Exception as e:
+            logger.error(f"[{request_id}] Failed to get job metadata: {e}")
+            raise RedisOperationError(
+                "Failed to retrieve job metadata",
+                context=context.with_update(operation="get_job_meta")
+            )
+        
+        # Check if job exists and belongs to the organization
+        if not meta:
+            logger.warning(f"[{request_id}] Job {job_id} not found for organization {organization_id}")
+            raise DataSourceNotFoundError(
+                "Job not found",
+                context=context
+            )
+        
+        if meta.get("organization_id") != organization_id:
+            logger.warning(f"[{request_id}] Access denied - job {job_id} belongs to different organization")
+            raise AuthorizationError(
+                "Access denied: job belongs to different organization",
+                context=context.with_update(actual_org=meta.get("organization_id"))
+            )
+        
+        # Get job status
+        try:
+            status = redis_client.hgetall(get_job_redis_key(organization_id, job_id, "status"))
+        except Exception as e:
+            logger.error(f"[{request_id}] Failed to get job status: {e}")
+            raise RedisOperationError(
+                "Failed to retrieve job status",
+                context=context.with_update(operation="get_job_status")
+            )
+        
+        # Get overall status
+        try:
+            overall_status = redis_client.get(get_job_redis_key(organization_id, job_id, "overall_status")) or "unknown"
+        except Exception as e:
+            logger.error(f"[{request_id}] Failed to get overall status: {e}")
+            overall_status = "unknown"
+        
+        # Log successful access
+        json_logger.log_json(
+            level="info",
+            action="get_job_status",
+            message="Status check successful",
+            organization_id=organization_id,
+            job_id=job_id,
+            status=overall_status,
+            extra={"request_id": request_id}
+        )
+        
+        logger.debug(f"[{request_id}] Status check completed for job {job_id}: {overall_status}")
+        return JobStatusResponse(job_id=job_id, status=overall_status, sources=status)
+        
+    except (ValidationError, AuthorizationError, DataSourceNotFoundError, RedisOperationError):
+        raise
+    except Exception as e:
+        logger.error(f"[{request_id}] Unexpected error in get_job_status: {e}")
+        raise SalescienceError(
+            "Failed to retrieve job status due to internal error",
+            context=context
+        )
 
 # Endpoint: Get job results
 @app.get("/results/{job_id}", response_model=JobResultsResponse, tags=["Jobs"])
@@ -563,34 +752,79 @@ def get_job_results(job_id: str, organization_id: str = Query(..., description="
         HTTPException: If the job doesn't exist, belongs to a different organization,
                       or has no results yet
     """
-    meta = redis_client.hgetall(get_job_redis_key(organization_id, job_id, "meta"))
-    if not meta or meta.get("organization_id") != organization_id:
-        json_logger.log_json(
-            level="warning",
-            action="get_job_results",
-            message="Forbidden results access: organization_id does not match",
-            organization_id=organization_id,
-            job_id=job_id,
-            status="forbidden"
-        )
-        raise HTTPException(status_code=403, detail="Forbidden: organization_id does not match.")
-    results = redis_client.hgetall(get_job_redis_key(organization_id, job_id, "result"))
-    if not results:
-        json_logger.log_json(
-            level="warning",
-            action="get_job_results",
-            message="No results found for this job",
-            organization_id=organization_id,
-            job_id=job_id,
-            status="not_found"
-        )
-        raise HTTPException(status_code=404, detail="No results found for this job.")
-    json_logger.log_json(
-        level="info",
-        action="get_job_results",
-        message="Results access successful",
+    request_id = str(uuid.uuid4())
+    context = ErrorContext(
+        operation="get_job_results",
+        request_id=request_id,
         organization_id=organization_id,
-        job_id=job_id,
-        status="success"
+        job_id=job_id
     )
-    return JobResultsResponse(job_id=job_id, results=results)
+    
+    try:
+        logger.debug(f"[{request_id}] Retrieving results for job {job_id}")
+        
+        # Get job metadata and verify organization access
+        try:
+            meta = redis_client.hgetall(get_job_redis_key(organization_id, job_id, "meta"))
+        except Exception as e:
+            logger.error(f"[{request_id}] Failed to get job metadata: {e}")
+            raise RedisOperationError(
+                "Failed to retrieve job metadata",
+                context=context.with_update(operation="get_job_meta")
+            )
+        
+        # Check if job exists and belongs to the organization
+        if not meta:
+            logger.warning(f"[{request_id}] Job {job_id} not found for organization {organization_id}")
+            raise DataSourceNotFoundError(
+                "Job not found",
+                context=context
+            )
+        
+        if meta.get("organization_id") != organization_id:
+            logger.warning(f"[{request_id}] Access denied - job {job_id} belongs to different organization")
+            raise AuthorizationError(
+                "Access denied: job belongs to different organization",
+                context=context.with_update(actual_org=meta.get("organization_id"))
+            )
+        
+        # Get job results
+        try:
+            results = redis_client.hgetall(get_job_redis_key(organization_id, job_id, "result"))
+        except Exception as e:
+            logger.error(f"[{request_id}] Failed to get job results: {e}")
+            raise RedisOperationError(
+                "Failed to retrieve job results",
+                context=context.with_update(operation="get_job_results")
+            )
+        
+        # Check if results exist
+        if not results:
+            logger.info(f"[{request_id}] No results found for job {job_id}")
+            raise DataSourceNotFoundError(
+                "No results found for this job",
+                context=context
+            )
+        
+        # Log successful access
+        json_logger.log_json(
+            level="info",
+            action="get_job_results",
+            message="Results access successful",
+            organization_id=organization_id,
+            job_id=job_id,
+            status="success",
+            extra={"request_id": request_id, "num_results": len(results)}
+        )
+        
+        logger.debug(f"[{request_id}] Results retrieval completed for job {job_id}")
+        return JobResultsResponse(job_id=job_id, results=results)
+        
+    except (ValidationError, AuthorizationError, DataSourceNotFoundError, RedisOperationError):
+        raise
+    except Exception as e:
+        logger.error(f"[{request_id}] Unexpected error in get_job_results: {e}")
+        raise SalescienceError(
+            "Failed to retrieve job results due to internal error",
+            context=context
+        )
